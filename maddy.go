@@ -61,6 +61,7 @@ import (
 	_ "github.com/foxcpp/maddy/internal/check/requiretls"
 	_ "github.com/foxcpp/maddy/internal/check/rspamd"
 	_ "github.com/foxcpp/maddy/internal/check/spf"
+	_ "github.com/foxcpp/maddy/internal/endpoint/api"
 	_ "github.com/foxcpp/maddy/internal/endpoint/dovecot_sasld"
 	_ "github.com/foxcpp/maddy/internal/endpoint/imap"
 	_ "github.com/foxcpp/maddy/internal/endpoint/openmetrics"
