@@ -178,7 +178,7 @@ func TestUsersCreateRollsBackCreds(t *testing.T) {
 	tok := login(t, e, "admin@example.org", "hunter2hunter2")
 
 	fs := e.store.(*fakeStorage)
-	fs.err = errors.New("database is locked")
+	fs.createErr = errors.New("database is locked")
 
 	rec := do(t, e, "POST", "/api/v1/users", tok,
 		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
@@ -188,8 +188,134 @@ func TestUsersCreateRollsBackCreds(t *testing.T) {
 	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); !errors.Is(err, module.ErrUnknownCredentials) {
 		t.Fatal("credential must be rolled back when the mailbox cannot be created")
 	}
-	if !strings.Contains(rec.Body.String(), `"partial"`) {
-		t.Fatalf("partial state must be reported: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), `"partial":[]`) {
+		t.Fatalf("a clean rollback must report an empty partial: %s", rec.Body.String())
+	}
+}
+
+func TestUsersCreateRollsBackCleanly(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	fs := e.store.(*fakeStorage)
+	fs.createErr = errors.New("database is locked")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"partial":[]`) {
+		t.Fatalf("nothing may survive a failed storage create: %s", rec.Body.String())
+	}
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); !errors.Is(err, module.ErrUnknownCredentials) {
+		t.Fatal("credential must not survive the rollback")
+	}
+	accts, err := fs.ListIMAPAccts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range accts {
+		if a == "dave@example.org" {
+			t.Fatal("mailbox must not survive the rollback")
+		}
+	}
+}
+
+func TestUsersCreateRollsBackMailbox(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	fs := e.store.(*fakeStorage)
+	// The account is created, then folder creation fails: the mailbox itself
+	// must be rolled back, not stranded behind the rolled-back credential.
+	fs.mboxErr = errors.New("folder creation failed")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"partial":[]`) {
+		t.Fatalf("both halves must be rolled back: %s", rec.Body.String())
+	}
+	accts, err := fs.ListIMAPAccts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range accts {
+		if a == "dave@example.org" {
+			t.Fatal("the mailbox must be rolled back, not stranded")
+		}
+	}
+}
+
+func TestUsersCreateReportsStrandedCreds(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	fs := e.store.(*fakeStorage)
+	fs.mboxErr = errors.New("folder creation failed")
+	e.creds.(*fakeCreds).deleteErr = errors.New("database is locked")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"partial":["creds"]`) {
+		t.Fatalf("the stranded credential must be named: %s", rec.Body.String())
+	}
+	// The mailbox half was still rolled back...
+	accts, err := fs.ListIMAPAccts()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range accts {
+		if a == "dave@example.org" {
+			t.Fatal("the mailbox must be rolled back even when the credential is not")
+		}
+	}
+	// ...and the credential is what is left behind.
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); err != nil {
+		t.Fatal("the stranded credential must still authenticate:", err)
+	}
+}
+
+func TestUsersDeleteUnmanageableStorage(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	e.store = &storageOnly{f: e.store.(*fakeStorage)}
+
+	rec := do(t, e, "DELETE", "/api/v1/users/bob@example.org", tok, "")
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"deleted":["creds"]`) || !strings.Contains(body, `"failed":["storage"]`) {
+		t.Fatalf("must report the split outcome: %s", body)
+	}
+}
+
+func TestUsersDeleteMissing(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	rec := do(t, e, "DELETE", "/api/v1/users/nobody@example.org", tok, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("deleting a missing user is a 404: code %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUsersCreateRejectsBareLocalpart(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"postmaster","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("a bare localpart must be refused: code %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

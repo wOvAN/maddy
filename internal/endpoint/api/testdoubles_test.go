@@ -36,6 +36,9 @@ type fakeCreds struct {
 	mu    sync.Mutex
 	users map[string]string
 	err   error
+	// deleteErr is a DeleteUser-only fault knob so a test can strand a
+	// credential on purpose; nil means DeleteUser behaves normally.
+	deleteErr error
 }
 
 func newFakeCreds() *fakeCreds {
@@ -100,6 +103,9 @@ func (f *fakeCreds) DeleteUser(username string) error {
 	if f.err != nil {
 		return f.err
 	}
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	if _, ok := f.users[username]; !ok {
 		return module.ErrUnknownCredentials
 	}
@@ -111,6 +117,14 @@ type fakeStorage struct {
 	mu    sync.Mutex
 	accts map[string]*fakeUser
 	err   error
+	// createErr fails only CreateIMAPAcct: the global err knob would also
+	// break ListIMAPAccts, and the create handler's existence check lists
+	// first, so a create-only fault is the only way to drive the
+	// create-rollback path.
+	createErr error
+	// mboxErr is stamped onto every account CreateIMAPAcct builds, so a test
+	// can make folder creation fail on a user the handler creates mid-request.
+	mboxErr error
 	// gets counts GetIMAPAcct hand-outs; tests compare it against the
 	// logouts the handed-out accounts receive, so a leaked account object
 	// fails the suite.
@@ -171,12 +185,34 @@ func (f *fakeStorage) CreateIMAPAcct(username string) error {
 	if f.err != nil {
 		return f.err
 	}
+	if f.createErr != nil {
+		return f.createErr
+	}
 	if _, ok := f.accts[username]; ok {
 		return errors.New("acct already exists")
 	}
-	f.accts[username] = newFakeUser(username)
+	u := newFakeUser(username)
+	u.mboxErr = f.mboxErr
+	f.accts[username] = u
 	return nil
 }
+
+// storageOnly is a module.Storage without the ManageableStorage role, so a
+// test can drive the "backend cannot manage accounts" path (errUnmanageable)
+// over the same in-memory state as fakeStorage.
+type storageOnly struct {
+	f *fakeStorage
+}
+
+func (s *storageOnly) GetOrCreateIMAPAcct(username string) (imapbackend.User, error) {
+	return s.f.GetOrCreateIMAPAcct(username)
+}
+
+func (s *storageOnly) GetIMAPAcct(username string) (imapbackend.User, error) {
+	return s.f.GetIMAPAcct(username)
+}
+
+func (s *storageOnly) IMAPExtensions() []string { return s.f.IMAPExtensions() }
 
 func (f *fakeStorage) DeleteIMAPAcct(username string) error {
 	f.mu.Lock()
@@ -207,6 +243,8 @@ type fakeUser struct {
 	mboxes  map[string][]fakeMsg
 	special map[string]string
 	limit   *uint32
+	// mboxErr makes CreateMailboxSpecial fail on purpose; nil by default.
+	mboxErr error
 	// logouts counts Logout calls so a handler that borrows an account and
 	// forgets to release it fails the suite (see fakeStorage.gets).
 	logouts int
@@ -272,6 +310,12 @@ func (u *fakeUser) GetMailbox(name string, readOnly bool, conn imapbackend.Conn)
 func (u *fakeUser) CreateMailbox(name string) error { return u.createMailbox(name, "") }
 
 func (u *fakeUser) CreateMailboxSpecial(name, specialUseAttr string) error {
+	u.mu.Lock()
+	mboxErr := u.mboxErr
+	u.mu.Unlock()
+	if mboxErr != nil {
+		return mboxErr
+	}
 	return u.createMailbox(name, specialUseAttr)
 }
 

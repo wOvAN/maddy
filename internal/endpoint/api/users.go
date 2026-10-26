@@ -24,6 +24,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 
 	imap "github.com/emersion/go-imap"
 	imapbackend "github.com/emersion/go-imap/backend"
@@ -156,6 +157,14 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
 		return
 	}
+	// address.Valid deliberately accepts a bare localpart ("postmaster") and the
+	// username profile normalizes it to "postmaster@", a key shape the CLI never
+	// produces (pass_table stores the raw name). One spelling per account, so
+	// the API requires a full address.
+	if _, _, err := address.Split(username); err != nil {
+		writeErr(w, http.StatusBadRequest, "username must be a full address", err.Error(), nil)
+		return
+	}
 
 	if exists, err := e.userExists(username); err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to look up user", err.Error(), nil)
@@ -178,9 +187,11 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ms, err := e.manageableStorage()
+	acctCreated := false
 	if err == nil {
 		err = ms.CreateIMAPAcct(username)
 		if err == nil {
+			acctCreated = true
 			var u imapbackend.User
 			u, err = e.store.GetIMAPAcct(username)
 			if err == nil {
@@ -197,6 +208,7 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err == nil {
+		e.log.Msg("user created", "user", username, "admin", ctxAdminUser(r.Context()))
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
 			"username": username, "creds": true, "storage": true,
 		})
@@ -204,14 +216,23 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// There is no transaction between the credentials store and the storage
-	// store; the CLI has the same split. Undo the credential, and if that also
-	// fails say exactly what is left behind.
-	rollback := e.creds.DeleteUser(username)
-	code, partial := http.StatusInternalServerError, "creds_not_rolled_back"
-	if rollback == nil {
-		partial = "storage"
+	// store; the CLI has the same split. Undo *both* halves — rolling back only
+	// the credential strands a real mailbox (go-imap-sql's CreateUser creates
+	// INBOX and Archive), and that address is then uncreatable through the API
+	// forever, because userExists reports the mailbox. Report exactly what
+	// survived: partial lists the stores that still hold a record.
+	partial := []string{}
+	if e.creds.DeleteUser(username) != nil {
+		partial = append(partial, "creds")
 	}
-	writeErr(w, code, "failed to create IMAP account", err.Error(),
+	if acctCreated && ms != nil && ms.DeleteIMAPAcct(username) != nil {
+		partial = append(partial, "storage")
+	}
+	if len(partial) != 0 {
+		e.log.Msg("user create left state behind", "user", username,
+			"admin", ctxAdminUser(r.Context()), "partial", strings.Join(partial, ","))
+	}
+	writeErr(w, http.StatusInternalServerError, "failed to create IMAP account", err.Error(),
 		map[string]interface{}{"partial": partial})
 }
 
@@ -233,7 +254,11 @@ func (e *Endpoint) handleUsersDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if msErr != nil {
+		// Joined, not dropped: the handler answers with
+		// statusForStoreError(credsErr) and credsErr.Error(), so an unrecorded
+		// error on this path is a nil dereference.
 		failed = append(failed, "storage")
+		credsErr = errors.Join(credsErr, msErr)
 	} else if err := ms.DeleteIMAPAcct(username); err != nil {
 		failed = append(failed, "storage")
 		credsErr = errors.Join(credsErr, err)
@@ -242,9 +267,12 @@ func (e *Endpoint) handleUsersDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(failed) != 0 {
-		writeErr(w, http.StatusInternalServerError, "failed to delete user", credsErr.Error(),
+		e.log.Msg("user delete incomplete", "user", username,
+			"admin", ctxAdminUser(r.Context()), "failed", strings.Join(failed, ","))
+		writeErr(w, statusForStoreError(credsErr), "failed to delete user", credsErr.Error(),
 			map[string]interface{}{"deleted": deleted, "failed": failed})
 		return
 	}
+	e.log.Msg("user deleted", "user", username, "admin", ctxAdminUser(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": deleted})
 }

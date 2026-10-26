@@ -44,10 +44,15 @@ type limitUser interface {
 	SetMessageLimit(val *uint32) error
 }
 
+// errUnmanageable is a sentinel, not a prose error: statusForStoreError maps it
+// to 501, which is how the delete path distinguishes a capability gap from a
+// dead database.
+var errUnmanageable = errors.New("storage backend does not support accounts management")
+
 func (e *Endpoint) manageableStorage() (module.ManageableStorage, error) {
 	ms, ok := e.store.(module.ManageableStorage)
 	if !ok {
-		return nil, errors.New("storage backend does not support accounts management")
+		return nil, errUnmanageable
 	}
 	return ms, nil
 }
@@ -79,10 +84,17 @@ func (e *Endpoint) userExists(username string) (bool, error) {
 	}
 	ms, err := e.manageableStorage()
 	if err == nil {
-		if accts, err2 := ms.ListIMAPAccts(); err2 == nil {
-			users = append(users, accts...)
+		accts, err := ms.ListIMAPAccts()
+		if err != nil {
+			// A storage listing that failed must not read as "no mailbox
+			// exists": the create would then reach the storage module and fail
+			// there as a 500 for what is really a 409.
+			return false, err
 		}
+		users = append(users, accts...)
 	}
+	// A storage backend with no management role cannot hold a mailbox at all, so
+	// the credentials list is the complete answer there.
 	for _, u := range users {
 		if address.Equal(u, username) {
 			return true, nil
