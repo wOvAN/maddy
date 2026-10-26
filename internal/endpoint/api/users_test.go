@@ -306,6 +306,33 @@ func TestUsersDeleteMissing(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("deleting a missing user is a 404: code %d: %s", rec.Code, rec.Body.String())
 	}
+	// Both halves are missing, so "deleted" is empty and must serialize as
+	// [], not null: the client branches on membership.
+	if !strings.Contains(rec.Body.String(), `"deleted":[`) {
+		t.Fatalf("an empty deleted half must serialize as an array: %s", rec.Body.String())
+	}
+}
+
+func TestUsersCreateStorageListFailure(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	fs := e.store.(*fakeStorage)
+	// The global knob breaks ListIMAPAccts, so the existence lookup cannot
+	// finish; a failed listing must not read as "no mailbox exists".
+	fs.err = errors.New("database is locked")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "failed to look up user") {
+		t.Fatalf("a failed storage listing must not read as 'no mailbox': %s", rec.Body.String())
+	}
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); !errors.Is(err, module.ErrUnknownCredentials) {
+		t.Fatal("no credential may be created when the existence lookup fails")
+	}
 }
 
 func TestUsersCreateRejectsBareLocalpart(t *testing.T) {

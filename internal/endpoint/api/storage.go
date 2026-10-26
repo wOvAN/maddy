@@ -61,6 +61,9 @@ func (e *Endpoint) manageableStorage() (module.ManageableStorage, error) {
 // the username (a malformed one is a 400, not a store lookup), maps a miss
 // onto an HTTP status through statusForStoreError, and returns the account
 // borrowed from the store: the caller must release it with Logout().
+// ponytail: only the username is normalized; mailbox names are not, because
+// go-imap-sql compares them case-sensitively and normalizing would break valid
+// names. If per-mailbox routes land, normalize there, per the store's rules.
 func (e *Endpoint) userFor(raw string) (imapbackend.User, int, error) {
 	username, err := e.normalize(raw)
 	if err != nil {

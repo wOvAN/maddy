@@ -180,6 +180,8 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Storage == nil || !*req.Storage {
+		e.log.Msg("user created", "user", username, "storage", false,
+			"admin", ctxAdminUser(r.Context()))
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
 			"username": username, "creds": true, "storage": false,
 		})
@@ -208,7 +210,8 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err == nil {
-		e.log.Msg("user created", "user", username, "admin", ctxAdminUser(r.Context()))
+		e.log.Msg("user created", "user", username, "storage", true,
+			"admin", ctxAdminUser(r.Context()))
 		writeJSON(w, http.StatusCreated, map[string]interface{}{
 			"username": username, "creds": true, "storage": true,
 		})
@@ -244,7 +247,9 @@ func (e *Endpoint) handleUsersDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	ms, msErr := e.manageableStorage()
 
-	var deleted, failed []string
+	// Initialized, not nil: a delete that removed only storage must serialize
+	// "deleted":[], not "deleted":null, because the client branches on membership.
+	deleted, failed := []string{}, []string{}
 
 	credsErr := e.creds.DeleteUser(username)
 	if credsErr == nil {
