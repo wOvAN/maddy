@@ -90,9 +90,9 @@ func (f *fakeCreds) SetUserPassword(username, password string) error {
 	if f.err != nil {
 		return f.err
 	}
-	if _, ok := f.users[username]; !ok {
-		return module.ErrUnknownCredentials
-	}
+	// Faithful to pass_table.SetUserPassword: no existence check, and the
+	// table's SetKey runs the INSERT first, so a missing user gets a
+	// credential. The 404 for a nonexistent user is the handler's job.
 	f.users[username] = password
 	return nil
 }

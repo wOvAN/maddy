@@ -73,6 +73,22 @@ func (e *Endpoint) userFor(raw string) (imapbackend.User, int, error) {
 	return u, 0, nil
 }
 
+// credsExist answers "does this address have a credentials record", the creds
+// half of userExists. Password change needs it on its own, because
+// pass_table.SetUserPassword inserts.
+func (e *Endpoint) credsExist(username string) (bool, error) {
+	users, err := e.creds.ListUsers()
+	if err != nil {
+		return false, err
+	}
+	for _, u := range users {
+		if address.Equal(u, username) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // userExists scans both stores for the account; PlainUserDB and
 // ManageableStorage expose no lookup-by-name, and maddy is a
 // small-installation server, so a linear scan of the two lists is the whole

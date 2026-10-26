@@ -361,6 +361,50 @@ func TestUserPassword(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("short password: code %d", rec.Code)
 	}
+
+	// A password change must not create an account: pass_table.SetUserPassword
+	// inserts (its table's SetKey runs the INSERT first), so this 404 is
+	// enforced by the handler, not by the double.
+	rec = do(t, e, "PUT", "/api/v1/users/ghost@example.org/password", tok, `{"password":"newnewnew"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing user: code %d", rec.Code)
+	}
+	if err := e.creds.AuthPlain("ghost@example.org", "newnewnew"); err == nil {
+		t.Fatal("password change created a credential for a nonexistent user")
+	}
+}
+
+func TestUserAppendlimitValidation(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+	if err := e.store.(*fakeStorage).CreateIMAPAcct("bob@example.org"); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := e.store.GetIMAPAcct("bob@example.org")
+	fu := u.(*fakeUser)
+
+	// An absent value must not clear the limit; null must.
+	require := func(body string, want int, wantSet bool) {
+		t.Helper()
+		rec := do(t, e, "PUT", "/api/v1/users/bob@example.org/appendlimit", tok, body)
+		if rec.Code != want {
+			t.Fatalf("%s: code %d: %s", body, rec.Code, rec.Body.String())
+		}
+		if lim := fu.CreateMessageLimit(); (lim != nil) != wantSet {
+			t.Fatalf("%s: limit set %v, want set %v", body, lim != nil, wantSet)
+		}
+	}
+	require(`{"value":1024}`, http.StatusOK, true)
+	if lim := fu.CreateMessageLimit(); lim == nil || *lim != 1024 {
+		t.Fatalf("1024: %v", lim)
+	}
+	require(`{"value":0}`, http.StatusOK, true) // 0 is a real limit, not "unset"
+	if lim := fu.CreateMessageLimit(); lim == nil || *lim != 0 {
+		t.Fatalf("0: %v", lim)
+	}
+	require(`{}`, http.StatusBadRequest, true)            // absent must not clear
+	require(`{"value":"x"}`, http.StatusBadRequest, true) // not a number
+	require(`{"value":null}`, http.StatusOK, false)       // null clears
 }
 
 func TestUserAppendlimit(t *testing.T) {

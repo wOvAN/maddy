@@ -294,7 +294,26 @@ func (e *Endpoint) handleUserPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "password must be at least 8 characters", "", nil)
 		return
 	}
+	// pass_table.SetUserPassword has no existence check: it hashes and calls
+	// table.SetKey, whose first statement is the table's INSERT. Setting a
+	// password for an address nobody has therefore *creates* the credential, so
+	// the endpoint must look the account up itself or it answers 200 for a
+	// mailbox that does not exist and logs a change that never happened.
+	exists, err := e.credsExist(username)
+	if err != nil {
+		e.log.Msg("user password change failed", "user", username,
+			"admin", ctxAdminUser(r.Context()), "error", err.Error())
+		writeErr(w, http.StatusInternalServerError, "failed to look up user", err.Error(), nil)
+		return
+	}
+	if !exists {
+		e.log.Msg("user password change refused", "user", username, "admin", ctxAdminUser(r.Context()))
+		writeErr(w, http.StatusNotFound, "no such user", "", nil)
+		return
+	}
 	if err := e.creds.SetUserPassword(username, req.Password); err != nil {
+		e.log.Msg("user password change failed", "user", username,
+			"admin", ctxAdminUser(r.Context()), "error", err.Error())
 		writeErr(w, statusForStoreError(err), "failed to set password", err.Error(), nil)
 		return
 	}
@@ -308,17 +327,37 @@ func (e *Endpoint) handleUserAppendlimit(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
 		return
 	}
+	// A *uint32 cannot tell {"value":null} (clear, per spec) from {} (absent),
+	// and an absent field must not silently clear a quota: decode the field
+	// presence separately, the way the CLI's --value flag does. RawMessage (not
+	// *RawMessage) on purpose: the json package nulls pointer fields, which
+	// would make null indistinguishable from absent.
 	var req struct {
-		Value *uint32 `json:"value"`
+		Value json.RawMessage `json:"value"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
 		return
 	}
+	if req.Value == nil {
+		writeErr(w, http.StatusBadRequest, "value is required (null clears the limit)", "", nil)
+		return
+	}
+	// nil is the "no limit" spelling (the CLI passes it to clear), so it is
+	// allocated only for a real number.
+	var value *uint32
+	if string(req.Value) != "null" {
+		v := new(uint32)
+		if err := json.Unmarshal(req.Value, v); err != nil {
+			writeErr(w, http.StatusBadRequest, "value must be a number or null", err.Error(), nil)
+			return
+		}
+		value = v
+	}
 
-	u, err := e.store.GetIMAPAcct(username)
+	u, code, err := e.userFor(username)
 	if err != nil {
-		writeErr(w, statusForStoreError(err), "failed to get IMAP account", err.Error(), nil)
+		writeErr(w, code, "failed to get IMAP account", err.Error(), nil)
 		return
 	}
 	defer func() { _ = u.Logout() }()
@@ -328,11 +367,13 @@ func (e *Endpoint) handleUserAppendlimit(w http.ResponseWriter, r *http.Request)
 		writeErr(w, http.StatusNotImplemented, "storage backend does not support per-account APPENDLIMIT", "", nil)
 		return
 	}
-	if err := lu.SetMessageLimit(req.Value); err != nil {
+	if err := lu.SetMessageLimit(value); err != nil {
+		e.log.Msg("user appendlimit change failed", "user", username,
+			"admin", ctxAdminUser(r.Context()), "error", err.Error())
 		writeErr(w, http.StatusInternalServerError, "failed to set APPENDLIMIT", err.Error(), nil)
 		return
 	}
 	e.log.Msg("user appendlimit changed", "user", username, "admin", ctxAdminUser(r.Context()),
-		"value", req.Value)
-	writeJSON(w, http.StatusOK, map[string]interface{}{"username": username, "appendlimit": req.Value})
+		"value", value)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"username": username, "appendlimit": value})
 }
