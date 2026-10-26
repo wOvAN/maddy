@@ -276,3 +276,63 @@ func (e *Endpoint) handleUsersDelete(w http.ResponseWriter, r *http.Request) {
 	e.log.Msg("user deleted", "user", username, "admin", ctxAdminUser(r.Context()))
 	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": deleted})
 }
+
+func (e *Endpoint) handleUserPassword(w http.ResponseWriter, r *http.Request) {
+	username, err := e.normalize(r.PathValue("user"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
+		return
+	}
+	if len(req.Password) < 8 {
+		writeErr(w, http.StatusBadRequest, "password must be at least 8 characters", "", nil)
+		return
+	}
+	if err := e.creds.SetUserPassword(username, req.Password); err != nil {
+		writeErr(w, statusForStoreError(err), "failed to set password", err.Error(), nil)
+		return
+	}
+	e.log.Msg("user password changed", "user", username, "admin", ctxAdminUser(r.Context()))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"username": username})
+}
+
+func (e *Endpoint) handleUserAppendlimit(w http.ResponseWriter, r *http.Request) {
+	username, err := e.normalize(r.PathValue("user"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+	var req struct {
+		Value *uint32 `json:"value"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
+		return
+	}
+
+	u, err := e.store.GetIMAPAcct(username)
+	if err != nil {
+		writeErr(w, statusForStoreError(err), "failed to get IMAP account", err.Error(), nil)
+		return
+	}
+	defer func() { _ = u.Logout() }()
+
+	lu, ok := u.(limitUser)
+	if !ok {
+		writeErr(w, http.StatusNotImplemented, "storage backend does not support per-account APPENDLIMIT", "", nil)
+		return
+	}
+	if err := lu.SetMessageLimit(req.Value); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to set APPENDLIMIT", err.Error(), nil)
+		return
+	}
+	e.log.Msg("user appendlimit changed", "user", username, "admin", ctxAdminUser(r.Context()),
+		"value", req.Value)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"username": username, "appendlimit": req.Value})
+}

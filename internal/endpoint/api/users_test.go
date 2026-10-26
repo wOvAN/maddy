@@ -340,3 +340,55 @@ func TestUsersDeletePartial(t *testing.T) {
 		t.Fatal("credential must be deleted even though storage failed")
 	}
 }
+
+func TestUserPassword(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	rec := do(t, e, "PUT", "/api/v1/users/bob@example.org/password", tok, `{"password":"newnewnew"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := e.creds.AuthPlain("bob@example.org", "newnewnew"); err != nil {
+		t.Fatal("password not changed")
+	}
+
+	rec = do(t, e, "PUT", "/api/v1/users/ghost@example.org/password", tok, `{"password":"newnewnew"}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing user: code %d", rec.Code)
+	}
+	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/password", tok, `{"password":"x"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("short password: code %d", rec.Code)
+	}
+}
+
+func TestUserAppendlimit(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+	if err := e.store.(*fakeStorage).CreateIMAPAcct("bob@example.org"); err != nil {
+		t.Fatal(err)
+	}
+
+	rec := do(t, e, "PUT", "/api/v1/users/bob@example.org/appendlimit", tok, `{"value":4096}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	u, _ := e.store.GetIMAPAcct("bob@example.org")
+	if lim := u.(*fakeUser).CreateMessageLimit(); lim == nil || *lim != 4096 {
+		t.Fatalf("limit not set: %v", lim)
+	}
+
+	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/appendlimit", tok, `{"value":null}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("clear: code %d", rec.Code)
+	}
+	if lim := u.(*fakeUser).CreateMessageLimit(); lim != nil {
+		t.Fatal("limit must be cleared by null")
+	}
+
+	rec = do(t, e, "PUT", "/api/v1/users/ghost@example.org/appendlimit", tok, `{"value":1}`)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("missing account: code %d", rec.Code)
+	}
+}

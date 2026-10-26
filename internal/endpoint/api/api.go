@@ -151,6 +151,8 @@ func (e *Endpoint) handler() http.Handler {
 		{http.MethodGet, "/api/v1/users", e.requireAdmin(e.handleUsersList)},
 		{http.MethodPost, "/api/v1/users", e.requireAdmin(e.handleUsersCreate)},
 		{http.MethodDelete, "/api/v1/users/{user}", e.requireAdmin(e.handleUsersDelete)},
+		{http.MethodPut, "/api/v1/users/{user}/password", e.requireAdmin(e.handleUserPassword)},
+		{http.MethodPut, "/api/v1/users/{user}/appendlimit", e.requireAdmin(e.handleUserAppendlimit)},
 	}
 
 	mux := http.NewServeMux()
