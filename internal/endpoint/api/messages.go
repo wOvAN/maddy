@@ -139,18 +139,23 @@ func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "failed to read message", err.Error(), nil)
 		return
 	}
-	var body []byte
-	for _, msg := range fetched {
-		var err error
-		body, err = drainBody(msg, e.maxMsgSize)
-		if err != nil {
-			// The literal failed mid-read (a corrupt/missing extStore blob
-			// surfaces here, go-imap-sql fetch.go:230-251); a 200 with a
-			// prefix of the body would report a read failure as a complete
-			// message.
-			writeErr(w, http.StatusInternalServerError, "failed to read message body", err.Error(), nil)
-			return
-		}
+	if len(fetched) == 0 {
+		// "no such message" is a property of the fetch, not of the body: a
+		// message that exists with an empty RFC822 literal is a 200 with an
+		// empty body.
+		writeErr(w, http.StatusNotFound, "no such message", "", nil)
+		return
+	}
+	// A one-uid set fetches one message; take it and stop, so a widened set
+	// can never make the last body silently win.
+	body, err := drainBody(fetched[0], e.maxMsgSize)
+	if err != nil {
+		// The literal failed mid-read (a corrupt/missing extStore blob
+		// surfaces here, go-imap-sql fetch.go:230-251); a 200 with a
+		// prefix of the body would report a read failure as a complete
+		// message.
+		writeErr(w, http.StatusInternalServerError, "failed to read message body", err.Error(), nil)
+		return
 	}
 	if int64(len(body)) > e.maxMsgSize {
 		// The literal did not fit the cap, so body is a truncation of it;
@@ -158,11 +163,8 @@ func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusRequestEntityTooLarge, "message exceeds max_msg_size", "", nil)
 		return
 	}
-	if body == nil {
-		writeErr(w, http.StatusNotFound, "no such message", "", nil)
-		return
-	}
 	w.Header().Set("Content-Type", "application/rfc822+text")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }

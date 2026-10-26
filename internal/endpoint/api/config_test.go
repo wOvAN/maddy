@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package api
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -26,12 +27,27 @@ import (
 	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
+	"github.com/foxcpp/maddy/framework/module/modules"
 )
+
+// The creds and storage directives are required in the config map, so unit
+// tests resolve them through the real inline-module machinery; these factories
+// hand it the same doubles the handler tests inject.
+func init() {
+	modules.Register("auth.apifake", func(_ *container.C, _, _ string) (module.Module, error) {
+		return newFakeCreds(), nil
+	})
+	modules.Register("storage.apifake", func(_ *container.C, _, _ string) (module.Module, error) {
+		return newFakeStorage(), nil
+	})
+}
 
 type cfgEndpointOpts struct {
 	children []config.Node
 	admins   []string
 	secret   string
+	// omit drops the injected creds/storage child, to pin the requiredness.
+	omit string
 }
 
 func configureTestEndpoint(t *testing.T, o cfgEndpointOpts) (*Endpoint, error) {
@@ -53,6 +69,16 @@ func configureTestEndpoint(t *testing.T, o cfgEndpointOpts) (*Endpoint, error) {
 	if len(o.admins) != 0 {
 		node.Children = append(node.Children, config.Node{
 			Name: "admins", Args: o.admins,
+		})
+	}
+	if o.omit != "creds" {
+		node.Children = append(node.Children, config.Node{
+			Name: "creds", Args: []string{"apifake"},
+		})
+	}
+	if o.omit != "storage" {
+		node.Children = append(node.Children, config.Node{
+			Name: "storage", Args: []string{"apifake"},
 		})
 	}
 	node.Children = append(node.Children, o.children...)
@@ -115,6 +141,25 @@ func TestConfigRequiresPositiveRateLimit(t *testing.T) {
 				t.Fatal("expected an error for a zero rate limit control")
 			}
 		})
+	}
+}
+
+func TestConfigRequiresCredsStorage(t *testing.T) {
+	// maddy verify-config runs Configure only: a block this module refuses to
+	// start with must fail there, not only at boot. The map, not Start, is
+	// where the validation step sees it.
+	for _, omit := range []string{"creds", "storage"} {
+		_, err := configureTestEndpoint(t, cfgEndpointOpts{
+			admins: []string{"admin@example.org"},
+			secret: "0123456789abcdef0123456789abcdef",
+			omit:   omit,
+		})
+		if err == nil {
+			t.Fatalf("missing %s must be a configuration error", omit)
+		}
+		if !strings.Contains(err.Error(), omit) {
+			t.Fatalf("missing %s: the error must name the directive: %v", omit, err)
+		}
 	}
 }
 

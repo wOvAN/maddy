@@ -207,6 +207,33 @@ func TestMailboxHierarchy(t *testing.T) {
 		t.Fatalf("after delete: %v", names)
 	}
 
+	// Renaming INBOX is not a no-op: the backend renames the row, cascades
+	// the children and re-creates an empty INBOX (go-imap-sql
+	// user.go:318-332), so INBOX keeps existing next to its old, renamed
+	// children.
+	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok, `{"name":"INBOX.Work"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create INBOX.Work: code %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/mailboxes/INBOX", tok, `{"new_name":"Old"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rename INBOX: code %d: %s", rec.Code, rec.Body.String())
+	}
+	res = struct {
+		Name  string `json:"name"`
+		Moved int    `json:"moved"`
+	}{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Name != "Old" || res.Moved != 1 {
+		t.Fatalf("rename INBOX must report the child it moved: %+v", res)
+	}
+	if names := mboxNames(t, e, tok); !sameNames(names,
+		[]string{"C.B", "C.B.C", "INBOX", "Old", "Old.Work"}) {
+		t.Fatalf("after renaming INBOX: %v", names)
+	}
+
 	assertAccountBalance(t, e)
 }
 

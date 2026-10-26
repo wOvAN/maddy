@@ -190,6 +190,9 @@ func TestMessages(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/rfc822+text" {
 		t.Fatalf("content type: %s", ct)
 	}
+	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+		t.Fatalf("cache control: %s", cc)
+	}
 
 	// uid 0 is a destructive wildcard (go-imap-mess ResolveSeq rewrites a
 	// zero uid bound to the mailbox's highest uid, mailbox.go:60-65): it must
@@ -253,6 +256,15 @@ func TestMessages(t *testing.T) {
 	}
 	if len(fu.mboxes["INBOX"]) != 1 {
 		t.Fatalf("message not deleted: %d", len(fu.mboxes["INBOX"]))
+	}
+
+	// A message that exists with an empty body is served as 200 with an
+	// empty body: "no such message" is derived from the fetch result, not
+	// from the body being nil after the read.
+	fu.plant("INBOX", imap.Envelope{Subject: "empty"}, "")
+	rec = do(t, e, "GET", base+"/3", tok, "")
+	if rec.Code != http.StatusOK || rec.Body.Len() != 0 {
+		t.Fatalf("empty-body message: code %d: %q", rec.Code, rec.Body.String())
 	}
 
 	// A uid that is not there is a 404 (mess.ErrNoMessages), not a 200

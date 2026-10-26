@@ -1,3 +1,21 @@
+/*
+Maddy Mail Server - Composable all-in-one email server.
+Copyright © 2019-2020 Max Mazurov <fox.cpp@disroot.org>, Maddy Mail Server contributors
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*/
+
 package api
 
 import (
@@ -122,15 +140,13 @@ func newTestEndpoint(addr string) (*Endpoint, error) {
 		Children: []config.Node{
 			{Name: "admins", Args: []string{"admin@example.org"}},
 			{Name: "secret", Args: []string{"0123456789abcdef0123456789abcdef"}},
+			{Name: "creds", Args: []string{"apifake"}},
+			{Name: "storage", Args: []string{"apifake"}},
 		},
 	}
 	cfg := config.NewMap(nil, node)
 	if err := endp.Configure(nil, cfg); err != nil {
 		return nil, err
 	}
-	// Start refuses to serve without module instances; tests inject the fakes
-	// because the registry is not available in unit tests.
-	endp.creds = newFakeCreds()
-	endp.store = newFakeStorage()
 	return endp, nil
 }

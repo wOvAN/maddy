@@ -91,7 +91,7 @@ func TestAPIAccountManagement(tt *testing.T) {
 		resp, err := client.Do(req)
 		require.NoError(t, err)
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		require.NoError(t, err)
 		return resp, body
 	}
@@ -134,9 +134,26 @@ func TestAPIAccountManagement(tt *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
 	require.Contains(t, string(body), "postmaster@maddy.test")
 
+	// Auth negatives against the real credentials store: a wrong password is
+	// a 401, and a request with no token at all is a 401 on a protected
+	// route.
+	resp, _ = do(http.MethodPost, "/api/v1/login", "",
+		[]byte(`{"username":"postmaster@maddy.test","password":"wrongpassword"}`))
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	resp, _ = do(http.MethodGet, "/api/v1/users", "", nil)
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
 	resp, body = do(http.MethodGet, "/api/v1/users", tok.Token, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, string(body), "new@maddy.test")
+
+	// A real mailbox that is not in admins authenticates and is refused with
+	// 403. The address is spelled so the localpart changes under
+	// casefolding, the seam where the credentials store (PRECISFold) and the
+	// storage store (lower-casing) can disagree.
+	resp, body = do(http.MethodPost, "/api/v1/login", "",
+		[]byte(`{"username":"New@Maddy.test","password":"pppppppppp"}`))
+	require.Equal(t, http.StatusForbidden, resp.StatusCode, string(body))
 
 	// Messages, through the real go-imap-sql backend: this is the only place
 	// the mb.(*imapsql.Mailbox).DelMessages assertion in imapsql.go runs at
@@ -165,6 +182,15 @@ func TestAPIAccountManagement(tt *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	require.Contains(t, string(body), "Subject: api reload probe")
 	require.Contains(t, string(body), "Hello from the management API.")
+
+	// The shape api.md documents and no unit test can pin faithfully: in a
+	// mailbox that holds messages, deleting a UID that is not present is not
+	// an error (ResolveSeq forwards a uid set to the backend when the mailbox
+	// is not empty, and marking zero rows is a success), and the count delta
+	// says so.
+	resp, body = do(http.MethodDelete, msgsPath+"/99999", tok.Token, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	require.JSONEq(t, `{"uid":99999,"deleted":0}`, string(body))
 
 	resp, body = do(http.MethodDelete, msgPath, tok.Token, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))

@@ -23,8 +23,12 @@ import (
 	"net/http"
 )
 
+// writeJSON is the single JSON exit of the API: every response goes through
+// it, so this is also where the cache hygiene lives — tokens, message bodies
+// and account state must not sit in an intermediary's cache even on loopback.
 func writeJSON(w http.ResponseWriter, code int, body interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(code)
 	if body != nil {
 		_ = json.NewEncoder(w).Encode(body)

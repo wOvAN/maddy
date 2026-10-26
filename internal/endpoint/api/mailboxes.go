@@ -132,7 +132,14 @@ func (e *Endpoint) handleMboxesDelete(w http.ResponseWriter, r *http.Request) {
 	if st, err := u.Status(name, []imap.StatusItem{imap.StatusMessages}); err == nil {
 		messages = st.Messages
 	}
-	leftBehind, _ := countChildren(u, name)
+	// left_behind exists to warn about stranded children, so a failed
+	// enumeration must not pass as the reassuring zero: log it and report 0
+	// with the failure on the record.
+	leftBehind, chErr := countChildren(u, name)
+	if chErr != nil {
+		e.log.Msg("mailbox children count failed", "user", username, "mailbox", name,
+			"admin", ctxAdminUser(r.Context()), "error", chErr.Error())
+	}
 
 	if err := u.DeleteMailbox(name); err != nil {
 		e.log.Msg("mailbox delete failed", "user", username, "mailbox", name,

@@ -80,14 +80,14 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 	var adminsList []string
 	var secretStr string
 
-	cfg.Custom("creds", false, false, nil, func(m *config.Map, node config.Node) (interface{}, error) {
+	cfg.Custom("creds", false, true, nil, func(m *config.Map, node config.Node) (interface{}, error) {
 		var creds module.PlainUserDB
 		if err := modconfig.ModuleFromNode("auth", node.Args, node, m.Globals, &creds); err != nil {
 			return nil, err
 		}
 		return creds, nil
 	}, &e.creds)
-	cfg.Custom("storage", false, false, nil, modconfig.StorageDirective, &e.store)
+	cfg.Custom("storage", false, true, nil, modconfig.StorageDirective, &e.store)
 	cfg.StringList("admins", false, true, nil, &adminsList)
 	cfg.String("secret", false, true, "", &secretStr)
 	cfg.Int("login_rate_limit", false, false, 10, &e.loginLimit)
@@ -99,8 +99,10 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 		return err
 	}
 
-	// creds/storage are checked in Start, not here, so that the module can be
-	// configured in unit tests without building a module registry.
+	// creds and storage are marked required in the map (imap.go:97 is the
+	// precedent) so that `maddy verify-config`, which runs Configure only,
+	// sees a block this module refuses to start with; the Start check below
+	// stays as the belt for programmatically built instances.
 	if len(adminsList) == 0 {
 		return fmt.Errorf("%s: admins must list at least one administrator", modName)
 	}
@@ -242,6 +244,11 @@ func (e *Endpoint) Start() error {
 	e.serv.ReadTimeout = 30 * time.Second
 	e.serv.IdleTimeout = 2 * time.Minute
 
+	// Written before the serve goroutines start: handleHealth reads it from
+	// request goroutines, and a time.Time write racing those reads is a data
+	// race, not just a smell.
+	e.startTime = time.Now()
+
 	for _, endp := range e.endpoints {
 		l, err := netresource.Listen(endp.Network(), endp.Address())
 		if err != nil {
@@ -266,7 +273,6 @@ func (e *Endpoint) Start() error {
 			}
 		}()
 	}
-	e.startTime = time.Now()
 	return nil
 }
 

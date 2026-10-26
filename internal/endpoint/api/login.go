@@ -29,6 +29,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/foxcpp/maddy/framework/module"
 	"golang.org/x/crypto/bcrypt"
@@ -59,6 +60,22 @@ func remoteIP(r *http.Request) string {
 	return host
 }
 
+// truncForLog bounds an attacker-supplied string in a log line to 256 bytes,
+// the login body is capped at 8 KiB and the failure line is writable by one
+// unauthenticated POST. The cut walks back to a UTF-8 rune boundary so the
+// log cannot gain invalid bytes.
+func truncForLog(s string) string {
+	const max = 256
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "…"
+}
+
 func (e *Endpoint) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !e.limiter.Allow(remoteIP(r)) {
 		e.log.Msg("login rate limit exceeded", "ip", remoteIP(r))
@@ -85,7 +102,11 @@ func (e *Endpoint) handleLogin(w http.ResponseWriter, r *http.Request) {
 			// credentials record". Burn the same cost on both.
 			checkAgainstDummyHash(req.Password)
 		}
-		e.log.Msg("login failed", "user", req.Username, "ip", remoteIP(r))
+		// The failure line logs what the attacker sent, bounded: the login
+		// body is capped at 8 KiB and this line is writable by one
+		// unauthenticated POST, so the raw username alone is unbounded log
+		// volume here.
+		e.log.Msg("login failed", "user", truncForLog(req.Username), "ip", remoteIP(r))
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeErr(w, http.StatusUnauthorized, "invalid username or password", "", nil)
 		return
@@ -111,7 +132,7 @@ func (e *Endpoint) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "failed to issue token", err.Error(), nil)
 		return
 	}
-	e.log.Msg("login", "user", admin, "ip", remoteIP(r))
+	e.log.DebugMsg("login", "user", admin, "ip", remoteIP(r))
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"token":      token,
 		"expires_at": exp,
@@ -155,6 +176,15 @@ func (e *Endpoint) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 // checkAgainstDummyHash spends one bcrypt comparison on a password that cannot
 // match, so that a missing account and a wrong password take the same time.
 // golang.org/x/crypto is already a maddy dependency (auth.pass_table uses it).
+//
+// ponytail: the equal-cost claim is bcrypt-specific. pass_table's hash is
+// configurable (internal/auth/pass_table/hash.go:35, argon2id selectable), so
+// with "hash argon2" a known account costs argon2 and an unknown one costs
+// bcrypt: the enumeration oracle reopens, inverted. Deriving the dummy from
+// the creds module's own hash is not reachable through the module interfaces;
+// the upgrade path is to have the creds module report its hash/cost (or to
+// construct the dummy from the first ListUsers entry) and compare against
+// that, if argon2 deployments make the residual leak matter.
 var dummyHash = []byte("$2a$10$NV0t9gIecyMGEImWU2KBPugGnaxu1MdzP8QActmDCHU/OQTRJIffm")
 
 func checkAgainstDummyHash(password string) {

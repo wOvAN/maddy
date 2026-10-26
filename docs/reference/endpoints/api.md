@@ -8,6 +8,11 @@ Unlike the maddyctl subcommands, which re-parse the configuration file and open
 the databases in a second process, this endpoint talks to the running server's
 own module instances in-process.
 
+The module is registered by the binary (a blank import in the root package), so
+rolling the BINARY back to a build without it (e.g. upstream 0.9.6) turns a
+configuration containing an `api {}` block into an unknown-module parse error:
+remove the block before rolling back, not after.
+
 ## Configuration
 
 Multiple listen addresses can be given. TLS endpoints (`tls://`) are not
@@ -291,12 +296,18 @@ produce `413` as well.
   `0.9.7-0.20261026191710-7931ac3fd885+dirty`, a `go install`-style build
   reports `go-build`), not from the version string `build.sh` injects into the
   binary. Use it as a liveness probe, not as a version probe.
-- The `api` sublogger logs every login, successful and failed, and every
+- The `api` sublogger logs every failed login at info (successful ones at
+  debug), and every
   mutating action that succeeded; of the failing ones it logs the storage-layer
   failures (mailbox, message, password, APPENDLIMIT, incomplete user delete) and
   a user create that left state behind. A user create that fails and rolls back
   cleanly, and the create whose existence lookup fails, are not logged; the
   response is the only record of them.
+- The equal-cost login comparison is bcrypt-specific: a login for an address
+  with no credential spends one bcrypt comparison so that it takes as long as a
+  wrong password. If `creds` is a `pass_table` with a non-bcrypt hash
+  (`hash argon2`), a known and an unknown address take different times, and
+  `/login` discloses address existence by timing.
 
 ## Reload
 

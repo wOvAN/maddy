@@ -31,6 +31,7 @@ import (
 	imapbackend "github.com/emersion/go-imap/backend"
 	mess "github.com/foxcpp/go-imap-mess"
 	imapsql "github.com/foxcpp/go-imap-sql"
+	"github.com/foxcpp/maddy/framework/config"
 	"github.com/foxcpp/maddy/framework/module"
 )
 
@@ -114,6 +115,13 @@ func (f *fakeCreds) DeleteUser(username string) error {
 	delete(f.users, username)
 	return nil
 }
+
+// The fakes double as registered modules ("auth.apifake",
+// "storage.apifake", registered in config_test.go) so unit tests can wire the
+// required creds/storage directives through the real ModuleFromNode path.
+func (f *fakeCreds) Name() string                          { return "apifake" }
+func (f *fakeCreds) InstanceName() string                  { return "" }
+func (f *fakeCreds) Configure([]string, *config.Map) error { return nil }
 
 type fakeStorage struct {
 	mu    sync.Mutex
@@ -236,6 +244,10 @@ func (f *fakeStorage) DeleteIMAPAcct(username string) error {
 	delete(f.accts, username)
 	return nil
 }
+
+func (f *fakeStorage) Name() string                          { return "apifake" }
+func (f *fakeStorage) InstanceName() string                  { return "" }
+func (f *fakeStorage) Configure([]string, *config.Map) error { return nil }
 
 type fakeMsg struct {
 	uid   uint32
@@ -416,6 +428,12 @@ func (u *fakeUser) RenameMailbox(existingName, newName string) error {
 	if sp, ok := u.special[existingName]; ok {
 		delete(u.special, existingName)
 		u.special[newName] = sp
+	}
+	// go-imap-sql re-creates an empty INBOX after INBOX was renamed
+	// (user.go:318-332: createMbox, mboxId, setInboxId in the same
+	// transaction), so renaming INBOX succeeds and INBOX keeps existing.
+	if strings.EqualFold(existingName, "INBOX") {
+		u.mboxes[existingName] = nil
 	}
 	return nil
 }
