@@ -2,7 +2,9 @@ package api
 
 import (
 	"net"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
 	"github.com/foxcpp/maddy/framework/container"
@@ -56,6 +58,57 @@ func TestEndpointServes(t *testing.T) {
 		t.Fatal("nothing is listening after Start:", err)
 	}
 	conn.Close()
+}
+
+func TestEarlyStopDrainsRequests(t *testing.T) {
+	// Bind on port 0 through netresource, then read back the real address from
+	// the tracker-owned listener: Start records the endpoint string, which is
+	// what the test dials.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := l.Addr().(*net.TCPAddr).String()
+	l.Close()
+
+	e, err := newTestEndpoint(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.creds, e.store = newFakeCreds(), newFakeStorage()
+	e.limiter = newRateLimiter(10, time.Minute)
+
+	// Replace the mux with a slow handler: EarlyStop must let the running
+	// request finish, while Stop would cut it.
+	e.serv.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.WriteHeader(http.StatusTeapot)
+	})
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		resp, err := http.Get("http://" + e.listenAddr + "/api/v1/health")
+		if err != nil {
+			done <- -1
+			return
+		}
+		resp.Body.Close()
+		done <- resp.StatusCode
+	}()
+
+	time.Sleep(50 * time.Millisecond) // let the request reach the handler
+	if err := e.EarlyStop(); err != nil {
+		t.Fatal("EarlyStop:", err)
+	}
+	if code := <-done; code != http.StatusTeapot {
+		t.Fatalf("in-flight request was cut, got code %d", code)
+	}
+	if err := e.Stop(); err != nil {
+		t.Fatal("Stop:", err)
+	}
 }
 
 func newTestEndpoint(addr string) (*Endpoint, error) {

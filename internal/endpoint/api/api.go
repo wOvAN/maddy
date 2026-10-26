@@ -67,6 +67,11 @@ type Endpoint struct {
 	listenersWg sync.WaitGroup
 	serv        http.Server
 	startTime   time.Time
+
+	// listenAddr is the address Start bound, read back from the
+	// netresource-owned listener; a tcp://…:0 endpoint binds an ephemeral port
+	// the config does not name.
+	listenAddr string
 }
 
 func New(c *container.C, _ string, args []string) (container.LifetimeModule, error) {
@@ -251,6 +256,11 @@ func (e *Endpoint) Start() error {
 			return fmt.Errorf("%s: %v", modName, err)
 		}
 
+		// Read the bound address back from the listener, not from the config
+		// string: a tcp://host:0 endpoint gets an ephemeral port the config
+		// does not name.
+		e.listenAddr = l.Addr().String()
+
 		e.listenersWg.Add(1)
 		go func() {
 			defer func() {
@@ -273,6 +283,23 @@ func (e *Endpoint) Start() error {
 func (e *Endpoint) Stop() error {
 	if err := e.serv.Close(); err != nil {
 		return err
+	}
+	e.listenersWg.Wait()
+	return nil
+}
+
+// EarlyStop drains in-flight requests before the reloaded container's instance
+// binds. openmetrics uses http.Server.Close, which cuts running requests;
+// management requests write to the databases, so they get a deadline instead.
+//
+// The port itself is safe: netresource.ListenerTracker hands out a duplicated
+// fd, so closing this instance's listener does not stop the tracked port from
+// accepting for the new instance.
+func (e *Endpoint) EarlyStop() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := e.serv.Shutdown(ctx); err != nil {
+		e.log.Error("shutdown failed", err)
 	}
 	e.listenersWg.Wait()
 	return nil

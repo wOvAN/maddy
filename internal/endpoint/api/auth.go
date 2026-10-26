@@ -43,7 +43,10 @@ const tokenTTL = 12 * time.Hour
 
 // The endpoint is started, reloaded and stopped by the container; assert that
 // contract compiles rather than discovering it at boot.
-var _ container.LifetimeModule = &Endpoint{}
+var (
+	_ container.LifetimeModule  = &Endpoint{}
+	_ container.EarlyStopModule = &Endpoint{}
+)
 
 // makeToken builds a stateless bearer token: base64url(username|exp) and a
 // hex HMAC-SHA256 over exactly that payload.
