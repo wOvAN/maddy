@@ -140,20 +140,34 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 }
 
 func (e *Endpoint) handler() http.Handler {
-	// The route table doubles as the 404/405 decision: a JSON client must
-	// never have to parse the router's text/plain errors, and the standard
-	// ServeMux exposes no hook for its miss answers.
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/login", e.handleLogin)
+	mux.HandleFunc("GET /api/v1/health", e.handleHealth)
+	mux.HandleFunc("GET /api/v1/users", e.requireAdmin(e.handleUsersList))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/api/v1/login" && r.Method == http.MethodPost:
-			e.handleLogin(w, r)
-		case r.URL.Path == "/api/v1/health" && r.Method == http.MethodGet:
-			e.handleHealth(w, r)
-		case r.URL.Path == "/api/v1/login" || r.URL.Path == "/api/v1/health":
-			writeErr(w, http.StatusMethodNotAllowed, "method not allowed", r.Method, nil)
-		default:
-			writeErr(w, http.StatusNotFound, "no such endpoint", r.URL.Path, nil)
+		h, pattern := mux.Handler(r)
+		if pattern != "" {
+			h.ServeHTTP(w, r)
+			return
 		}
+		// The router answers both a path miss and a method miss with an empty
+		// pattern, so the wrapper cannot tell the two apart from the return
+		// values alone: a method miss must fall through to the router's own
+		// 405 (text/plain with Allow, like every other maddy endpoint), a path
+		// miss to the JSON envelope. Probe the methods this endpoint registers
+		// to decide which miss it is.
+		probe := *r
+		for _, m := range []string{http.MethodGet, http.MethodPost} {
+			if m == r.Method {
+				continue
+			}
+			probe.Method = m
+			if _, p := mux.Handler(&probe); p != "" {
+				h.ServeHTTP(w, r)
+				return
+			}
+		}
+		writeErr(w, http.StatusNotFound, "no such endpoint", r.URL.Path, nil)
 	})
 }
 

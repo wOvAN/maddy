@@ -133,8 +133,8 @@ func TestRequireAdmin(t *testing.T) {
 	e := loginEndpoint(t)
 	tok := login(t, e, "admin@example.org", "hunter2hunter2")
 
-	// Task 4 registers no admin route (the first one arrives in Task 5), so the
-	// middleware is exercised through a probe handler.
+	// The middleware is exercised through a probe handler so its answers are
+	// tested independent of any resource route.
 	probe := e.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"admin": ctxAdminUser(r.Context())})
 	})
@@ -195,16 +195,16 @@ func TestAuthHeadersAndEnvelope(t *testing.T) {
 		t.Fatal("no dummy hash to spend the equal-cost comparison on")
 	}
 
-	// Router misses and wrong methods use the JSON envelope, and 429 says when
-	// to come back.
+	// Router misses use the JSON envelope; a wrong method gets the router's
+	// own 405 with an Allow header; 429 says when to come back.
 	rec = do(t, e, "GET", "/api/v1/nope", tok, "")
 	if rec.Code != http.StatusNotFound ||
 		!strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
 		t.Fatalf("404 envelope: code %d type %s", rec.Code, rec.Header().Get("Content-Type"))
 	}
 	rec = do(t, e, "GET", "/api/v1/login", tok, "")
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("405 envelope: code %d", rec.Code)
+	if rec.Code != http.StatusMethodNotAllowed || rec.Header().Get("Allow") == "" {
+		t.Fatalf("405: code %d allow %q", rec.Code, rec.Header().Get("Allow"))
 	}
 	for i := 0; i < e.loginLimit+2; i++ {
 		do(t, e, "POST", "/api/v1/login", "", `{"username":"nobody@example.org","password":"x"}`)

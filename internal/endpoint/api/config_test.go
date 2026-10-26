@@ -145,7 +145,7 @@ func TestConfigRejectsUnknownDirective(t *testing.T) {
 	}
 }
 
-// credentialsStore/storageStore are the test doubles reused by every handler
+// fakeCreds/fakeStorage are the test doubles reused by every handler
 // test below; they implement the module role interfaces the endpoint binds to.
 var (
 	_ module.PlainUserDB       = (*fakeCreds)(nil)
