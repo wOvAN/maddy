@@ -104,6 +104,12 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 	if len(secretStr) < 16 {
 		return fmt.Errorf("%s: secret must be at least 16 bytes", modName)
 	}
+	// A zero window makes the limiter allow everything, i.e. it turns a
+	// mandatory control off without saying so; negative durations are already
+	// rejected by config.Map.Duration.
+	if e.loginLimit <= 0 || e.loginWindow <= 0 {
+		return fmt.Errorf("%s: login_rate_limit and login_rate_window must be positive", modName)
+	}
 	e.normalize = authz.NormalizeAuto
 	if err := e.setAdmins(adminsList); err != nil {
 		return err

@@ -95,6 +95,29 @@ func TestConfigRequiresLongSecret(t *testing.T) {
 	}
 }
 
+func TestConfigRequiresPositiveRateLimit(t *testing.T) {
+	// A zero value turns the limiter into allow-everything, i.e. it switches
+	// off a mandatory control without saying so.
+	for _, tc := range []struct {
+		name string
+		arg  string
+	}{
+		{"login_rate_limit", "0"},
+		{"login_rate_window", "0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := configureTestEndpoint(t, cfgEndpointOpts{
+				admins:   []string{"admin@example.org"},
+				secret:   "0123456789abcdef0123456789abcdef",
+				children: []config.Node{{Name: tc.name, Args: []string{tc.arg}}},
+			})
+			if err == nil {
+				t.Fatal("expected an error for a zero rate limit control")
+			}
+		})
+	}
+}
+
 func TestConfigAdminsAreNormalized(t *testing.T) {
 	e, err := configureTestEndpoint(t, cfgEndpointOpts{
 		admins: []string{"ADMIN@Example.ORG"},

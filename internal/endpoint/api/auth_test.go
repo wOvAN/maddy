@@ -101,9 +101,9 @@ func TestTokenRejects(t *testing.T) {
 }
 
 // TestTokenRejectsPayloadShape pins the payload framing: the separator is
-// counted from the right, an empty subject is not a subject, and exp is parsed
+// counted from the right, an empty subject is not a subject, exp is parsed
 // strictly (see parseExp) so that a payload cannot carry an exp that outlives
-// tokenTTL.
+// tokenTTL, and the encoding is canonical.
 func TestTokenRejectsPayloadShape(t *testing.T) {
 	e := testAuthEndpoint(t)
 
@@ -138,8 +138,34 @@ func TestTokenRejectsPayloadShape(t *testing.T) {
 		}
 	}
 
+	// Canonical encodings: one logical token has exactly one accepted spelling.
+	// The hex signature must be lower case, and a 13-byte payload leaves two
+	// unused bits in its last base64url digit, so the next digit is a
+	// non-canonical spelling of the same bytes.
+	tok, err := e.makeToken("admin@example.org", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, sig, _ := strings.Cut(tok, ".")
+	canon := b64("abc|9999999999")
+	nonCanon := canon[:len(canon)-1] + string(canon[len(canon)-1]+1)
+	if nonCanon == canon {
+		t.Fatal("test setup: non-canonical payload must differ from the canonical one")
+	}
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{"upper case hex sig", payload + "." + strings.ToUpper(sig)},
+		{"non-canonical base64 payload", sign(nonCanon)},
+	} {
+		if user, err := e.verifyToken(tc.token); !errors.Is(err, errBadToken) {
+			t.Errorf("%s: want errBadToken, got %v (subject %q)", tc.name, err, user)
+		}
+	}
+
 	// The normal case must still work with an exp exactly at the boundary.
-	tok, err := e.makeToken("admin@example.org", time.Now().Add(tokenTTL))
+	tok, err = e.makeToken("admin@example.org", time.Now().Add(tokenTTL))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,12 +180,55 @@ func TestTokenIsNotPortableToOtherSubject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The subject is inside the signed payload, so editing it must break the
-	// signature rather than be trusted.
-	parts := strings.SplitN(tok, ".", 2)
-	user, err := e.verifyToken(strings.Repeat("0", len(parts[0])) + "." + parts[1])
-	if err == nil {
-		t.Fatalf("unsigned payload accepted, subject: %s", user)
+	// The subject is inside the signed payload, so re-signing a payload built
+	// for another subject must not be enough to become it.
+	other, err := e.makeToken("victim@example.org", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, otherSig, _ := strings.Cut(other, ".")
+	user, err := e.verifyToken(strings.SplitN(tok, ".", 2)[0] + "." + otherSig)
+	if !errors.Is(err, errBadToken) {
+		t.Fatalf("payload signed for one subject accepted for another: %v (%q)", err, user)
+	}
+}
+
+// TestTokenSurvivesNewEndpoint pins the property the stateless format exists
+// for: a SIGUSR2 reload builds a new container and a new instance of this
+// module, so a token minted by one instance must verify on another instance
+// configured with the same secret.
+func TestTokenSurvivesNewEndpoint(t *testing.T) {
+	e := testAuthEndpoint(t)
+	tok, err := e.makeToken("admin@example.org", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := configureTestEndpoint(t, cfgEndpointOpts{
+		admins: []string{"admin@example.org"},
+		secret: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	user, err := reloaded.verifyToken(tok)
+	if err != nil || user != "admin@example.org" {
+		t.Fatalf("reloaded endpoint rejected the token: %v (%q)", err, user)
+	}
+}
+
+func TestRateLimiterForgetsQuietKeys(t *testing.T) {
+	r := newRateLimiter(2, 30*time.Millisecond)
+	for i := 0; i < 200; i++ {
+		r.Allow("10.0.0." + strconv.Itoa(i))
+	}
+	time.Sleep(45 * time.Millisecond)
+	// A key whose window has passed is allowed again, and its stale attempts
+	// are forgotten when the key is touched.
+	if !r.Allow("10.0.0.1") {
+		t.Fatal("window must expire")
+	}
+	if n := len(r.attempts["10.0.0.1"]); n != 1 {
+		t.Fatalf("stale attempts must be forgotten on touch, %d left", n)
 	}
 }
 
@@ -177,26 +246,5 @@ func TestRateLimiterWindow(t *testing.T) {
 	time.Sleep(60 * time.Millisecond)
 	if !r.Allow("1.2.3.4") {
 		t.Fatal("window must expire")
-	}
-}
-
-func TestRateLimiterSweepPrunesQuietKeys(t *testing.T) {
-	r := newRateLimiter(10, 20*time.Millisecond)
-	for i := 0; i < 4100; i++ {
-		if !r.Allow(strconv.Itoa(i/256) + "." + strconv.Itoa(i%256)) {
-			t.Fatal("distinct keys must not be limited")
-		}
-	}
-	if len(r.attempts) != 4100 {
-		t.Fatalf("expected 4100 tracked keys, got %d", len(r.attempts))
-	}
-	// Once every entry is out of the window, the next allow sweeps the map
-	// back down to the key being touched.
-	time.Sleep(30 * time.Millisecond)
-	if !r.Allow("10.0.0.1") {
-		t.Fatal("swept key must be allowed again")
-	}
-	if len(r.attempts) != 1 {
-		t.Fatalf("sweep must drop quiet keys, got %d tracked keys", len(r.attempts))
 	}
 }

@@ -21,7 +21,6 @@ package api
 import (
 	"crypto/hmac"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -57,11 +56,13 @@ var _ container.LifetimeModule = &Endpoint{}
 func (e *Endpoint) makeToken(username string, exp time.Time) (string, error) {
 	payload := base64.RawURLEncoding.EncodeToString(
 		[]byte(username + "|" + strconv.FormatInt(exp.Unix(), 10)))
-	mac := hmac.New(sha256.New, e.secret)
-	if _, err := mac.Write([]byte(payload)); err != nil {
-		return "", err
-	}
-	return payload + "." + hex.EncodeToString(mac.Sum(nil)), nil
+	return payload + "." + hex.EncodeToString(hmacSHA256(e.secret, payload)), nil
+}
+
+func hmacSHA256(secret []byte, msg string) []byte {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(msg))
+	return mac.Sum(nil)
 }
 
 func (e *Endpoint) verifyToken(token string) (string, error) {
@@ -69,16 +70,13 @@ func (e *Endpoint) verifyToken(token string) (string, error) {
 	if !ok || payload == "" || sig == "" {
 		return "", errBadToken
 	}
-
 	want, err := hex.DecodeString(sig)
 	if err != nil {
 		return "", errBadToken
 	}
-	mac := hmac.New(sha256.New, e.secret)
-	if _, err := mac.Write([]byte(payload)); err != nil {
-		return "", errBadToken
-	}
-	if subtle.ConstantTimeCompare(mac.Sum(nil), want) != 1 {
+	// hmac.Equal is constant-time and length-checked; the signature is verified
+	// over the payload bytes before any of them are parsed.
+	if !hmac.Equal(hmacSHA256(e.secret, payload), want) {
 		return "", errBadToken
 	}
 
@@ -86,9 +84,16 @@ func (e *Endpoint) verifyToken(token string) (string, error) {
 	if err != nil {
 		return "", errBadToken
 	}
-	// Split at the LAST separator: an address is not supposed to contain '|',
-	// but a payload split from the front would silently misread exp and accept
-	// a token whose subject contains the separator.
+	// The accepted encoding must be canonical: base64url tolerates non-zero
+	// padding bits and hex tolerates upper case, so one logical token would
+	// otherwise have many byte-distinct spellings. That defeats any future
+	// per-token revocation list, rotation tracking or log dedup.
+	if base64.RawURLEncoding.EncodeToString(raw) != payload ||
+		hex.EncodeToString(want) != sig {
+		return "", errBadToken
+	}
+	// Split at the LAST separator: a payload split from the front would silently
+	// misread exp for a subject containing the separator.
 	sep := strings.LastIndexByte(string(raw), '|')
 	if sep <= 0 {
 		return "", errBadToken
@@ -128,7 +133,8 @@ func parseExp(s string) (int64, error) {
 	return strconv.ParseInt(s, 10, 64)
 }
 
-// rateLimiter is a fixed-window attempt counter, used for login attempts only.
+// rateLimiter is a sliding-window attempt counter, used for login attempts
+// only: each allowed attempt is remembered and counted against the window.
 type rateLimiter struct {
 	mu       sync.Mutex
 	max      int
@@ -151,27 +157,16 @@ func (r *rateLimiter) Allow(key string) bool {
 			kept = append(kept, t)
 		}
 	}
-	// ponytail: entries are only pruned for the key being touched, plus a
-	// full sweep past 4096 keys, so a client-IP flood cannot grow the map
-	// without bound. Upgrade path: a periodic sweep goroutine if 4096 is hit
-	// in practice.
-	if len(r.attempts) > 4096 {
-		for k, ts := range r.attempts {
-			live := ts[:0]
-			for _, t := range ts {
-				if now.Sub(t) < r.window {
-					live = append(live, t)
-				}
-			}
-			if len(live) == 0 {
-				delete(r.attempts, k)
-				continue
-			}
-			r.attempts[k] = live
-		}
+	if len(kept) == 0 {
+		// ponytail: quiet keys are forgotten on their next touch, so a key
+		// never seen again stays in the map — bounded by the number of distinct
+		// client IPs, not by the window. Upgrade path: a periodic sweep
+		// goroutine if the published port sees high IP churn.
+		delete(r.attempts, key)
+	} else {
+		r.attempts[key] = kept
 	}
 	if len(kept) >= r.max {
-		r.attempts[key] = kept
 		return false
 	}
 	r.attempts[key] = append(kept, now)
