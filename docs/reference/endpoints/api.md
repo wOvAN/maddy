@@ -44,8 +44,8 @@ IMAP storage module used for all account, mailbox and message operations. Must
 implement the `Storage` role. Operations that manage accounts
 (user list/create/delete) additionally require `ManageableStorage`; against a
 backend that does not implement it, listing and deleting users answer `501`
-while creating a user answers `500`, with its credentials half rolled back and
-listed in `partial`.
+while creating a user answers `500` — the credentials half it already created is
+rolled back, so `partial` comes back empty.
 
 ---
 
@@ -144,8 +144,9 @@ backend compares them case-sensitively. The hierarchy separator is `.`, so
 | `DELETE /api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}` | – | `200` `{uid, deleted:<count>}` |
 
 An error answer is `{"error":"..."}`, carrying `detail` with the underlying
-module error text when the failure came from a module (a login, token, rate
-limit or request-parsing failure has no module error and therefore no `detail`),
+module error text when the failure came from a module (a token refusal, an
+authorization refusal, a rate-limit refusal and the empty-message refusal are
+raised by this endpoint alone, so they have no `detail`),
 plus the route-specific fields listed above where they apply. The codes are:
 `400` malformed request; `401` bad login credentials,
 or a missing/malformed/expired token; `403` authenticated but not an
