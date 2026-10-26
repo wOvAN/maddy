@@ -23,6 +23,7 @@ import (
 	"net/http"
 
 	imapbackend "github.com/emersion/go-imap/backend"
+	"github.com/foxcpp/maddy/framework/address"
 	"github.com/foxcpp/maddy/framework/module"
 )
 
@@ -65,4 +66,27 @@ func (e *Endpoint) userFor(raw string) (imapbackend.User, int, error) {
 		return nil, statusForStoreError(err), err
 	}
 	return u, 0, nil
+}
+
+// userExists scans both stores for the account; PlainUserDB and
+// ManageableStorage expose no lookup-by-name, and maddy is a
+// small-installation server, so a linear scan of the two lists is the whole
+// job.
+func (e *Endpoint) userExists(username string) (bool, error) {
+	users, err := e.creds.ListUsers()
+	if err != nil {
+		return false, err
+	}
+	ms, err := e.manageableStorage()
+	if err == nil {
+		if accts, err2 := ms.ListIMAPAccts(); err2 == nil {
+			users = append(users, accts...)
+		}
+	}
+	for _, u := range users {
+		if address.Equal(u, username) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

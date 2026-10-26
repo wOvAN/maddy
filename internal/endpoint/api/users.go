@@ -19,8 +19,15 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package api
 
 import (
+	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"sort"
+
+	imap "github.com/emersion/go-imap"
+	imapbackend "github.com/emersion/go-imap/backend"
+	"github.com/foxcpp/maddy/framework/address"
 )
 
 type userEntry struct {
@@ -99,4 +106,145 @@ func (e *Endpoint) handleUsersList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{"users": res})
+}
+
+// createAcctFolders mirrors what "maddy imap-acct create" does: INBOX comes
+// from CreateIMAPAcct, then the five special-use folders are created, falling
+// back to a plain CREATE on a backend without SPECIAL-USE support
+// (internal/cli/ctl/imapacct.go:239-260).
+func (e *Endpoint) createAcctFolders(u imapbackend.User) error {
+	app, _ := u.(applier)
+	for _, box := range [][2]string{
+		{"Sent", imap.SentAttr}, {"Trash", imap.TrashAttr}, {"Junk", imap.JunkAttr},
+		{"Drafts", imap.DraftsAttr}, {"Archive", imap.ArchiveAttr},
+	} {
+		var err error
+		if app != nil {
+			err = app.CreateMailboxSpecial(box[0], box[1])
+		} else {
+			err = u.CreateMailbox(box[0])
+		}
+		if err != nil && !errors.Is(err, imapbackend.ErrMailboxAlreadyExists) {
+			return err
+		}
+	}
+	return nil
+}
+
+func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Username    string  `json:"username"`
+		Password    string  `json:"password"`
+		Storage     *bool   `json:"storage"`
+		Appendlimit *uint32 `json:"appendlimit"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
+		return
+	}
+	if !address.Valid(req.Username) || len(req.Password) < 8 {
+		writeErr(w, http.StatusBadRequest, "username must be an address and password at least 8 characters", "", nil)
+		return
+	}
+	// creds and storage store exactly the string they are handed (address
+	// normalization is configured on the imap/creds *consumers*, not inside
+	// these modules), so an admin posting "Dave@Example.org" would create an
+	// account that IMAP login, which normalizes before lookup, can never
+	// reach. Persist the normalized spelling.
+	username, err := e.normalize(req.Username)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+
+	if exists, err := e.userExists(username); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to look up user", err.Error(), nil)
+		return
+	} else if exists {
+		writeErr(w, http.StatusConflict, "user already exists", "", nil)
+		return
+	}
+
+	if err := e.creds.CreateUser(username, req.Password); err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to create credentials", err.Error(), nil)
+		return
+	}
+
+	if req.Storage == nil || !*req.Storage {
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"username": username, "creds": true, "storage": false,
+		})
+		return
+	}
+
+	ms, err := e.manageableStorage()
+	if err == nil {
+		err = ms.CreateIMAPAcct(username)
+		if err == nil {
+			var u imapbackend.User
+			u, err = e.store.GetIMAPAcct(username)
+			if err == nil {
+				defer func() { _ = u.Logout() }()
+				err = e.createAcctFolders(u)
+				if err == nil && req.Appendlimit != nil {
+					if lu, ok := u.(limitUser); ok {
+						err = lu.SetMessageLimit(req.Appendlimit)
+					} else {
+						err = errors.New("storage backend does not support per-account APPENDLIMIT")
+					}
+				}
+			}
+		}
+	}
+	if err == nil {
+		writeJSON(w, http.StatusCreated, map[string]interface{}{
+			"username": username, "creds": true, "storage": true,
+		})
+		return
+	}
+
+	// There is no transaction between the credentials store and the storage
+	// store; the CLI has the same split. Undo the credential, and if that also
+	// fails say exactly what is left behind.
+	rollback := e.creds.DeleteUser(username)
+	code, partial := http.StatusInternalServerError, "creds_not_rolled_back"
+	if rollback == nil {
+		partial = "storage"
+	}
+	writeErr(w, code, "failed to create IMAP account", err.Error(),
+		map[string]interface{}{"partial": partial})
+}
+
+func (e *Endpoint) handleUsersDelete(w http.ResponseWriter, r *http.Request) {
+	username, err := e.normalize(r.PathValue("user"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+	ms, msErr := e.manageableStorage()
+
+	var deleted, failed []string
+
+	credsErr := e.creds.DeleteUser(username)
+	if credsErr == nil {
+		deleted = append(deleted, "creds")
+	} else {
+		failed = append(failed, "creds")
+	}
+
+	if msErr != nil {
+		failed = append(failed, "storage")
+	} else if err := ms.DeleteIMAPAcct(username); err != nil {
+		failed = append(failed, "storage")
+		credsErr = errors.Join(credsErr, err)
+	} else {
+		deleted = append(deleted, "storage")
+	}
+
+	if len(failed) != 0 {
+		writeErr(w, http.StatusInternalServerError, "failed to delete user", credsErr.Error(),
+			map[string]interface{}{"deleted": deleted, "failed": failed})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": deleted})
 }

@@ -149,6 +149,8 @@ func (e *Endpoint) handler() http.Handler {
 		{http.MethodPost, "/api/v1/login", e.handleLogin},
 		{http.MethodGet, "/api/v1/health", e.handleHealth},
 		{http.MethodGet, "/api/v1/users", e.requireAdmin(e.handleUsersList)},
+		{http.MethodPost, "/api/v1/users", e.requireAdmin(e.handleUsersCreate)},
+		{http.MethodDelete, "/api/v1/users/{user}", e.requireAdmin(e.handleUsersDelete)},
 	}
 
 	mux := http.NewServeMux()

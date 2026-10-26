@@ -20,8 +20,12 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"testing"
+
+	"github.com/foxcpp/maddy/framework/module"
 )
 
 type usersListRes struct {
@@ -102,5 +106,111 @@ func TestUsersList(t *testing.T) {
 	}
 	if gets != logouts {
 		t.Fatalf("leaked account objects: %d GetIMAPAcct, %d Logout", gets, logouts)
+	}
+}
+
+func TestUsersCreate(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); err != nil {
+		t.Fatal("credential not created:", err)
+	}
+	u, err := e.store.GetIMAPAcct("dave@example.org")
+	if err != nil {
+		t.Fatal("mailbox not created:", err)
+	}
+	fu := u.(*fakeUser)
+	for _, name := range []string{"Sent", "Drafts", "Archive", "Junk", "Trash"} {
+		if _, ok := fu.special[name]; !ok {
+			t.Fatalf("special-use folder %s not created", name)
+		}
+	}
+}
+
+func TestUsersCreateNormalizesUsername(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"Dave@Example.ORG","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	var res struct {
+		Username string `json:"username"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Username != "dave@example.org" {
+		t.Fatalf("must store the normalized address: %s", res.Username)
+	}
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); err != nil {
+		t.Fatal("credential created under the raw spelling:", err)
+	}
+
+	// The same normalization applies to DELETE.
+	rec = do(t, e, "DELETE", "/api/v1/users/Dave@Example.ORG", tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete by raw spelling: code %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUsersCreateConflict(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+	// bob has credentials from loginEndpoint, so this must be refused.
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"bob@example.org","password":"pppppppppp"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestUsersCreateRollsBackCreds(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	fs := e.store.(*fakeStorage)
+	fs.err = errors.New("database is locked")
+
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true}`)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); !errors.Is(err, module.ErrUnknownCredentials) {
+		t.Fatal("credential must be rolled back when the mailbox cannot be created")
+	}
+	if !strings.Contains(rec.Body.String(), `"partial"`) {
+		t.Fatalf("partial state must be reported: %s", rec.Body.String())
+	}
+}
+
+func TestUsersDeletePartial(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+	if err := e.store.(*fakeStorage).CreateIMAPAcct("bob@example.org"); err != nil {
+		t.Fatal(err)
+	}
+	fs := e.store.(*fakeStorage)
+	fs.err = errors.New("database is locked")
+
+	rec := do(t, e, "DELETE", "/api/v1/users/bob@example.org", tok, "")
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"creds"`) || !strings.Contains(body, `"storage"`) {
+		t.Fatalf("must report both stores: %s", body)
+	}
+	if err := e.creds.AuthPlain("bob@example.org", "hunter3hunter3"); !errors.Is(err, module.ErrUnknownCredentials) {
+		t.Fatal("credential must be deleted even though storage failed")
 	}
 }
