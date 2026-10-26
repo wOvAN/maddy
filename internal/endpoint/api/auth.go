@@ -29,12 +29,22 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/foxcpp/maddy/framework/container"
 )
 
 var (
 	errBadToken = errors.New("malformed or unsigned token")
 	errExpired  = errors.New("expired token")
 )
+
+// tokenTTL is the token lifetime issued by handleLogin; verifyToken refuses
+// anything signed for longer, so the two cannot drift apart.
+const tokenTTL = 12 * time.Hour
+
+// The endpoint is started, reloaded and stopped by the container; assert that
+// contract compiles rather than discovering it at boot.
+var _ container.LifetimeModule = &Endpoint{}
 
 // makeToken builds a stateless bearer token: base64url(username|exp) and a
 // hex HMAC-SHA256 over exactly that payload.
@@ -76,18 +86,46 @@ func (e *Endpoint) verifyToken(token string) (string, error) {
 	if err != nil {
 		return "", errBadToken
 	}
-	user, expStr, ok := strings.Cut(string(raw), "|")
-	if !ok || user == "" {
+	// Split at the LAST separator: an address is not supposed to contain '|',
+	// but a payload split from the front would silently misread exp and accept
+	// a token whose subject contains the separator.
+	sep := strings.LastIndexByte(string(raw), '|')
+	if sep <= 0 {
 		return "", errBadToken
 	}
-	exp, err := strconv.ParseInt(expStr, 10, 64)
+	user, expStr := string(raw)[:sep], string(raw)[sep+1:]
+	exp, err := parseExp(expStr)
 	if err != nil {
 		return "", errBadToken
 	}
-	if time.Now().Unix() > exp {
+	now := time.Now().Unix()
+	if now > exp {
 		return "", errExpired
 	}
+	// The token is signed, so a client cannot pick exp — but the minting side
+	// must not be the only place that enforces the TTL: reject an exp beyond
+	// the lifetime this module issues, so a bug in makeToken (or a caller that
+	// passes a huge exp) cannot mint a near-eternal token.
+	if exp > now+int64(tokenTTL.Seconds())+60 {
+		return "", errBadToken
+	}
 	return user, nil
+}
+
+// parseExp parses the exp field of a token payload strictly: plain decimal, no
+// sign, no leading zeros, at most 19 digits. strconv.ParseInt accepts "+5",
+// "-5" and 25-digit strings that saturate to MaxInt64; a saturated exp would
+// outlive every reload, so the format is checked before parsing.
+func parseExp(s string) (int64, error) {
+	if s == "" || len(s) > 19 || (len(s) > 1 && s[0] == '0') {
+		return 0, errBadToken
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, errBadToken
+		}
+	}
+	return strconv.ParseInt(s, 10, 64)
 }
 
 // rateLimiter is a fixed-window attempt counter, used for login attempts only.
@@ -111,6 +149,25 @@ func (r *rateLimiter) Allow(key string) bool {
 	for _, t := range r.attempts[key] {
 		if now.Sub(t) < r.window {
 			kept = append(kept, t)
+		}
+	}
+	// ponytail: entries are only pruned for the key being touched, plus a
+	// full sweep past 4096 keys, so a client-IP flood cannot grow the map
+	// without bound. Upgrade path: a periodic sweep goroutine if 4096 is hit
+	// in practice.
+	if len(r.attempts) > 4096 {
+		for k, ts := range r.attempts {
+			live := ts[:0]
+			for _, t := range ts {
+				if now.Sub(t) < r.window {
+					live = append(live, t)
+				}
+			}
+			if len(live) == 0 {
+				delete(r.attempts, k)
+				continue
+			}
+			r.attempts[k] = live
 		}
 	}
 	if len(kept) >= r.max {
