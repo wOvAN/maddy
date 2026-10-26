@@ -23,6 +23,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-imap"
 )
 
 func TestMailboxes(t *testing.T) {
@@ -72,6 +74,15 @@ func TestMailboxes(t *testing.T) {
 	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok, `{}`)
 	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "name is required") {
 		t.Fatalf("missing field: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// go-imap-sql accepts only the five real SPECIAL-USE attributes and
+	// answers anything else with ErrUnsupportedSpecialAttr (user.go:194-203);
+	// the mapping to a 501 lives in statusForStoreError.
+	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok,
+		`{"name":"X","special_use":"\\Bogus"}`)
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("bogus special-use: code %d: %s", rec.Code, rec.Body.String())
 	}
 
 	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/mailboxes/Mailing%20Lists", tok,
@@ -171,6 +182,12 @@ func TestMailboxHierarchy(t *testing.T) {
 		t.Fatalf("after rename: %v", names)
 	}
 
+	// Plant a message so the delete response's "messages" field is asserted
+	// with a non-zero value: every double mailbox held 0 messages before, so a
+	// handler that stopped calling Status would stay green.
+	e.store.(*fakeStorage).acct("bob@example.org").plant("C",
+		imap.Envelope{Subject: "x"}, "From: a@example.org\r\nSubject: x\r\n\r\nx\r\n")
+
 	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/C", tok, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("delete: code %d: %s", rec.Code, rec.Body.String())
@@ -183,8 +200,8 @@ func TestMailboxHierarchy(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &del); err != nil {
 		t.Fatal(err)
 	}
-	if del.Deleted != "C" || del.LeftBehind != 2 {
-		t.Fatalf("delete must report the children it left behind: %+v", del)
+	if del.Deleted != "C" || del.Messages != 1 || del.LeftBehind != 2 {
+		t.Fatalf("delete must report the contents it destroyed: %+v", del)
 	}
 	if names := mboxNames(t, e, tok); !sameNames(names, []string{"C.B", "C.B.C", "INBOX"}) {
 		t.Fatalf("after delete: %v", names)

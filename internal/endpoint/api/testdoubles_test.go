@@ -166,6 +166,14 @@ func (f *fakeStorage) GetIMAPAcct(username string) (imapbackend.User, error) {
 
 func (f *fakeStorage) IMAPExtensions() []string { return nil }
 
+// acct hands a test the fakeUser behind an account without counting it as a
+// store hand-out, so assertAccountBalance keeps measuring handler leaks only.
+func (f *fakeStorage) acct(username string) *fakeUser {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.accts[username]
+}
+
 func (f *fakeStorage) ListIMAPAccts() ([]string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -311,6 +319,12 @@ func (u *fakeUser) GetMailbox(name string, readOnly bool, conn imapbackend.Conn)
 func (u *fakeUser) CreateMailbox(name string) error { return u.createMailbox(name, "") }
 
 func (u *fakeUser) CreateMailboxSpecial(name, specialUseAttr string) error {
+	// go-imap-sql accepts only the five real SPECIAL-USE attributes and
+	// answers anything else with ErrUnsupportedSpecialAttr (user.go:194-203);
+	// mirror it so a bogus attribute cannot reach the store.
+	if specialUseAttr != "" && !isSpecialUse(specialUseAttr) {
+		return imapsql.ErrUnsupportedSpecialAttr
+	}
 	u.mu.Lock()
 	mboxErr := u.mboxErr
 	u.mu.Unlock()
@@ -405,6 +419,20 @@ func (u *fakeUser) CreateMessage(mbox string, flags []string, date time.Time, bo
 	}
 	u.mboxes[mbox] = append(msgs, fakeMsg{uid: uid, flags: flags, date: date, body: b})
 	return nil
+}
+
+// plant adds a message with a known envelope to a mailbox, for tests that
+// assert on listed envelopes or on the contents a delete is about to destroy.
+func (u *fakeUser) plant(mbox string, env imap.Envelope, body string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	uid := uint32(1)
+	for _, m := range u.mboxes[mbox] {
+		if m.uid >= uid {
+			uid = m.uid + 1
+		}
+	}
+	u.mboxes[mbox] = append(u.mboxes[mbox], fakeMsg{uid: uid, env: env, body: []byte(body)})
 }
 
 func (u *fakeUser) CreateMessageLimit() *uint32 { return u.limit }

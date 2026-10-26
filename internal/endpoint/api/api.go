@@ -157,6 +157,10 @@ func (e *Endpoint) handler() http.Handler {
 		{http.MethodPost, "/api/v1/users/{user}/mailboxes", e.requireAdmin(e.handleMboxesCreate)},
 		{http.MethodPut, "/api/v1/users/{user}/mailboxes/{mbox}", e.requireAdmin(e.handleMboxesRename)},
 		{http.MethodDelete, "/api/v1/users/{user}/mailboxes/{mbox}", e.requireAdmin(e.handleMboxesDelete)},
+		{http.MethodGet, "/api/v1/users/{user}/mailboxes/{mbox}/messages", e.requireAdmin(e.handleMsgsList)},
+		{http.MethodPost, "/api/v1/users/{user}/mailboxes/{mbox}/messages", e.requireAdmin(e.handleMsgsAppend)},
+		{http.MethodGet, "/api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}", e.requireAdmin(e.handleMsgsGet)},
+		{http.MethodDelete, "/api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}", e.requireAdmin(e.handleMsgsDelete)},
 	}
 
 	mux := http.NewServeMux()
