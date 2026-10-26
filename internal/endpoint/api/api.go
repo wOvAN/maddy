@@ -28,6 +28,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -139,15 +140,27 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 }
 
 func (e *Endpoint) handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/login", e.handleLogin)
-	mux.HandleFunc("GET /api/v1/health", e.handleHealth)
-	// Stub behind the middleware so the auth surface is live from day one;
-	// the real user listing lands with the user management endpoints.
-	mux.HandleFunc("GET /api/v1/users", e.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]interface{}{"users": []string{}})
-	}))
-	return mux
+	// The route table doubles as the 404/405 decision: a JSON client must
+	// never have to parse the router's text/plain errors, and the standard
+	// ServeMux exposes no hook for its miss answers.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/v1/login" && r.Method == http.MethodPost:
+			e.handleLogin(w, r)
+		case r.URL.Path == "/api/v1/health" && r.Method == http.MethodGet:
+			e.handleHealth(w, r)
+		case r.URL.Path == "/api/v1/login" || r.URL.Path == "/api/v1/health":
+			writeErr(w, http.StatusMethodNotAllowed, "method not allowed", r.Method, nil)
+		default:
+			writeErr(w, http.StatusNotFound, "no such endpoint", r.URL.Path, nil)
+		}
+	})
+}
+
+// ctxAdminUser reads the authenticated subject set by requireAdmin.
+func ctxAdminUser(ctx context.Context) string {
+	user, _ := ctx.Value(ctxAdmin).(string)
+	return user
 }
 
 func (e *Endpoint) setAdmins(list []string) error {
@@ -179,6 +192,14 @@ func (e *Endpoint) Start() error {
 	if e.creds == nil || e.store == nil {
 		return fmt.Errorf("%s: creds and storage directives are required", modName)
 	}
+
+	// Read-side deadlines: the login route costs a bcrypt comparison, so a
+	// trickle-body client must not be able to pin a connection (and a
+	// goroutine) for the whole request rate. No WriteTimeout: a message body
+	// fetch writes up to max_msg_size (32 MiB by default) and a write deadline
+	// would cut legitimate large fetches at an arbitrary byte count.
+	e.serv.ReadTimeout = 30 * time.Second
+	e.serv.IdleTimeout = 2 * time.Minute
 
 	for _, endp := range e.endpoints {
 		l, err := netresource.Listen(endp.Network(), endp.Address())

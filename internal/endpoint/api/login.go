@@ -26,10 +26,12 @@ import (
 	"net"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/foxcpp/maddy/framework/module"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type ctxKey int
@@ -59,7 +61,8 @@ func remoteIP(r *http.Request) string {
 
 func (e *Endpoint) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !e.limiter.Allow(remoteIP(r)) {
-		e.log.Println("login rate limit exceeded for", remoteIP(r))
+		e.log.Msg("login rate limit exceeded", "ip", remoteIP(r))
+		w.Header().Set("Retry-After", strconv.Itoa(int(e.loginWindow.Seconds())))
 		writeErr(w, http.StatusTooManyRequests, "too many login attempts", "", nil)
 		return
 	}
@@ -74,56 +77,88 @@ func (e *Endpoint) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	err := e.creds.AuthPlain(req.Username, req.Password)
-	if errors.Is(err, module.ErrUnknownCredentials) || err != nil {
-		// The credential check itself is what costs time; do not branch on the
-		// error kind in a way that leaks whether the account exists.
-		e.log.Println("failed login attempt for", req.Username, "from", remoteIP(r))
+	if err != nil {
+		if errors.Is(err, module.ErrUnknownCredentials) {
+			// pass_table answers "no such user" before it hashes anything, so
+			// the two failure paths would differ by ~45ms of bcrypt and
+			// /login would be a latency oracle for "does this address have a
+			// credentials record". Burn the same cost on both.
+			checkAgainstDummyHash(req.Password)
+		}
+		e.log.Msg("login failed", "user", req.Username, "ip", remoteIP(r))
+		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeErr(w, http.StatusUnauthorized, "invalid username or password", "", nil)
 		return
 	}
 
-	if !e.isAdmin(req.Username) {
-		e.log.Println("login by non-administrator", req.Username, "from", remoteIP(r))
+	admin, err := e.normalize(req.Username)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+	if !e.isAdmin(admin) {
+		// The password was right and the address is not an administrator: the
+		// 403 discloses that the account exists by design, because an
+		// administrator is a mail account like any other.
+		e.log.Msg("login by non-administrator", "user", admin, "ip", remoteIP(r))
 		writeErr(w, http.StatusForbidden, "not an administrator", "", nil)
 		return
 	}
 
 	exp := time.Now().Add(tokenTTL)
-	token, err := e.makeToken(req.Username, exp)
+	token, err := e.makeToken(admin, exp)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to issue token", err.Error(), nil)
 		return
 	}
-	e.log.Println("login by", req.Username, "from", remoteIP(r))
+	e.log.Msg("login", "user", admin, "ip", remoteIP(r))
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"token":      token,
 		"expires_at": exp,
-		"username":   req.Username,
+		"username":   admin,
 	})
 }
 
 func (e *Endpoint) requireAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if !ok {
+		const scheme = "Bearer "
+		header := r.Header.Get("Authorization")
+		// The auth-scheme token is case-insensitive (RFC 7235); only the
+		// secret after it is not.
+		if len(header) <= len(scheme) || !strings.EqualFold(header[:len(scheme)], scheme) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "missing bearer token", "", nil)
 			return
 		}
-		user, err := e.verifyToken(token)
+		user, err := e.verifyToken(header[len(scheme):])
 		if err != nil {
 			msg := "invalid token"
 			if errors.Is(err, errExpired) {
 				msg = "expired token"
 			}
+			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, msg, "", nil)
 			return
 		}
-		if !e.isAdmin(user) {
+		// Store the normalized subject: every handler downstream uses it for
+		// creds/storage lookups and for the audit trail, and the client
+		// controls the spelling inside its own signed token.
+		admin, err := e.normalize(user)
+		if err != nil || !e.isAdmin(admin) {
 			writeErr(w, http.StatusForbidden, "not an administrator", "", nil)
 			return
 		}
-		next(w, r.WithContext(context.WithValue(r.Context(), ctxAdmin, user)))
+		next(w, r.WithContext(context.WithValue(r.Context(), ctxAdmin, admin)))
 	}
+}
+
+// checkAgainstDummyHash spends one bcrypt comparison on a password that cannot
+// match, so that a missing account and a wrong password take the same time.
+// golang.org/x/crypto is already a maddy dependency (auth.pass_table uses it).
+var dummyHash = []byte("$2a$10$NV0t9gIecyMGEImWU2KBPugGnaxu1MdzP8QActmDCHU/OQTRJIffm")
+
+func checkAgainstDummyHash(password string) {
+	_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 }
 
 func (e *Endpoint) handleHealth(w http.ResponseWriter, r *http.Request) {

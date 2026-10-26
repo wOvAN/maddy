@@ -133,14 +133,85 @@ func TestRequireAdmin(t *testing.T) {
 	e := loginEndpoint(t)
 	tok := login(t, e, "admin@example.org", "hunter2hunter2")
 
-	if rec := do(t, e, "GET", "/api/v1/users", "", ""); rec.Code != http.StatusUnauthorized {
+	// Task 4 registers no admin route (the first one arrives in Task 5), so the
+	// middleware is exercised through a probe handler.
+	probe := e.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"admin": ctxAdminUser(r.Context())})
+	})
+	call := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/api/v1/probe", nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		probe.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if rec := call(""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("no token: code %d", rec.Code)
 	}
-	if rec := do(t, e, "GET", "/api/v1/users", tok+"x", ""); rec.Code != http.StatusUnauthorized {
+	if rec := call(tok + "x"); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("bad token: code %d", rec.Code)
 	}
-	if rec := do(t, e, "GET", "/api/v1/users", tok, ""); rec.Code == http.StatusUnauthorized {
-		t.Fatal("valid token rejected")
+	rec := call(tok)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("valid token rejected: code %d", rec.Code)
+	}
+	var res struct {
+		Admin string `json:"admin"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Admin != "admin@example.org" {
+		t.Fatalf("context subject: %s", res.Admin)
+	}
+}
+
+func TestAuthHeadersAndEnvelope(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	// The auth scheme is case-insensitive.
+	req := httptest.NewRequest("GET", "/api/v1/probe", nil)
+	req.Header.Set("Authorization", "bearer "+tok)
+	rec := httptest.NewRecorder()
+	e.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"admin": ctxAdminUser(r.Context())})
+	}).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("lowercase scheme: code %d", rec.Code)
+	}
+
+	// A missing account and a wrong password must answer identically.
+	unknown := do(t, e, "POST", "/api/v1/login", "", `{"username":"nobody@example.org","password":"hunter2hunter2"}`)
+	wrong := do(t, e, "POST", "/api/v1/login", "", `{"username":"admin@example.org","password":"hunter2hunter3"}`)
+	if unknown.Code != wrong.Code || unknown.Body.String() != wrong.Body.String() {
+		t.Fatalf("login answers differ: %d %s vs %d %s",
+			unknown.Code, unknown.Body.String(), wrong.Code, wrong.Body.String())
+	}
+	if len(dummyHash) == 0 {
+		t.Fatal("no dummy hash to spend the equal-cost comparison on")
+	}
+
+	// Router misses and wrong methods use the JSON envelope, and 429 says when
+	// to come back.
+	rec = do(t, e, "GET", "/api/v1/nope", tok, "")
+	if rec.Code != http.StatusNotFound ||
+		!strings.HasPrefix(rec.Header().Get("Content-Type"), "application/json") {
+		t.Fatalf("404 envelope: code %d type %s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	rec = do(t, e, "GET", "/api/v1/login", tok, "")
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("405 envelope: code %d", rec.Code)
+	}
+	for i := 0; i < e.loginLimit+2; i++ {
+		do(t, e, "POST", "/api/v1/login", "", `{"username":"nobody@example.org","password":"x"}`)
+	}
+	rec = do(t, e, "POST", "/api/v1/login", "", `{"username":"nobody@example.org","password":"x"}`)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("429: code %d retry-after %q", rec.Code, rec.Header().Get("Retry-After"))
 	}
 }
 
