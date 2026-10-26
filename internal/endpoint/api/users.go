@@ -47,15 +47,29 @@ func (e *Endpoint) handleUsersList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The two stores normalize addresses differently (precis case mapping in
+	// pass_table, lower-casing in go-imap-sql), so the union is keyed by this
+	// endpoint's own normalization. A name that fails to normalize keeps its
+	// raw form: a list endpoint must not drop an account over it.
+	key := func(raw string) string {
+		n, err := e.normalize(raw)
+		if err != nil {
+			return raw
+		}
+		return n
+	}
+
 	set := make(map[string]*userEntry, len(credsList)+len(acctList))
 	for _, u := range credsList {
-		set[u] = &userEntry{Username: u, Creds: true}
+		k := key(u)
+		set[k] = &userEntry{Username: k, Creds: true}
 	}
 	for _, a := range acctList {
-		entry, ok := set[a]
+		k := key(a)
+		entry, ok := set[k]
 		if !ok {
-			entry = &userEntry{Username: a}
-			set[a] = entry
+			entry = &userEntry{Username: k}
+			set[k] = entry
 		}
 		entry.Storage = true
 	}
@@ -70,7 +84,11 @@ func (e *Endpoint) handleUsersList(w http.ResponseWriter, r *http.Request) {
 	for _, n := range names {
 		entry := set[n]
 		if entry.Storage {
-			if u, err := e.store.GetIMAPAcct(n); err == nil {
+			u, _, err := e.userFor(n)
+			if err != nil {
+				// The row is still reported; only the appendlimit is missing.
+				e.log.Msg("failed to read account state", "user", n, "error", err.Error())
+			} else {
 				if lu, ok := u.(limitUser); ok {
 					entry.Appendlimit = lu.CreateMessageLimit()
 				}

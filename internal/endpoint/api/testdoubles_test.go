@@ -111,6 +111,10 @@ type fakeStorage struct {
 	mu    sync.Mutex
 	accts map[string]*fakeUser
 	err   error
+	// gets counts GetIMAPAcct hand-outs; tests compare it against the
+	// logouts the handed-out accounts receive, so a leaked account object
+	// fails the suite.
+	gets int
 }
 
 func newFakeStorage() *fakeStorage {
@@ -141,6 +145,7 @@ func (f *fakeStorage) GetIMAPAcct(username string) (imapbackend.User, error) {
 	if !ok {
 		return nil, imapsql.ErrUserDoesntExists
 	}
+	f.gets++
 	return u, nil
 }
 
@@ -202,6 +207,9 @@ type fakeUser struct {
 	mboxes  map[string][]fakeMsg
 	special map[string]string
 	limit   *uint32
+	// logouts counts Logout calls so a handler that borrows an account and
+	// forgets to release it fails the suite (see fakeStorage.gets).
+	logouts int
 }
 
 var (
@@ -306,7 +314,12 @@ func (u *fakeUser) RenameMailbox(existingName, newName string) error {
 	return nil
 }
 
-func (u *fakeUser) Logout() error { return nil }
+func (u *fakeUser) Logout() error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.logouts++
+	return nil
+}
 
 func (u *fakeUser) CreateMessage(mbox string, flags []string, date time.Time, body imap.Literal, selected imapbackend.Mailbox) error {
 	u.mu.Lock()
@@ -350,7 +363,13 @@ func (m *fakeMailbox) Expunge() error            { return nil }
 func (m *fakeMailbox) Idle(done <-chan struct{}) {}
 
 func (m *fakeMailbox) Info() (*imap.MailboxInfo, error) {
-	return &imap.MailboxInfo{Name: m.name}, nil
+	m.user.mu.Lock()
+	defer m.user.mu.Unlock()
+	attrs := []string{}
+	if sp, ok := m.user.special[m.name]; ok {
+		attrs = append(attrs, sp)
+	}
+	return &imap.MailboxInfo{Name: m.name, Attributes: attrs}, nil
 }
 
 func (m *fakeMailbox) ListMessages(uid bool, set *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {

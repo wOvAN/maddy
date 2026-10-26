@@ -20,6 +20,7 @@ package api
 
 import (
 	"errors"
+	"net/http"
 
 	imapbackend "github.com/emersion/go-imap/backend"
 	"github.com/foxcpp/maddy/framework/module"
@@ -50,7 +51,15 @@ func (e *Endpoint) manageableStorage() (module.ManageableStorage, error) {
 	return ms, nil
 }
 
-func (e *Endpoint) userFor(username string) (imapbackend.User, int, error) {
+// userFor resolves the account a handler wants to work with. It normalizes
+// the username (a malformed one is a 400, not a store lookup), maps a miss
+// onto an HTTP status through statusForStoreError, and returns the account
+// borrowed from the store: the caller must release it with Logout().
+func (e *Endpoint) userFor(raw string) (imapbackend.User, int, error) {
+	username, err := e.normalize(raw)
+	if err != nil {
+		return nil, http.StatusBadRequest, err
+	}
 	u, err := e.store.GetIMAPAcct(username)
 	if err != nil {
 		return nil, statusForStoreError(err), err

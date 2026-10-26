@@ -140,30 +140,45 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 }
 
 func (e *Endpoint) handler() http.Handler {
+	type route struct {
+		method  string
+		pattern string
+		h       http.HandlerFunc
+	}
+	routes := []route{
+		{http.MethodPost, "/api/v1/login", e.handleLogin},
+		{http.MethodGet, "/api/v1/health", e.handleHealth},
+		{http.MethodGet, "/api/v1/users", e.requireAdmin(e.handleUsersList)},
+	}
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/v1/login", e.handleLogin)
-	mux.HandleFunc("GET /api/v1/health", e.handleHealth)
-	mux.HandleFunc("GET /api/v1/users", e.requireAdmin(e.handleUsersList))
+	// The methods to probe on a miss are derived from the route table, not
+	// listed separately: a new method registered here is probed automatically.
+	methods := make(map[string]struct{}, len(routes))
+	for _, rt := range routes {
+		mux.HandleFunc(rt.method+" "+rt.pattern, rt.h)
+		methods[rt.method] = struct{}{}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		h, pattern := mux.Handler(r)
+		_, pattern := mux.Handler(r)
 		if pattern != "" {
-			h.ServeHTTP(w, r)
+			// Serve through the mux, not the returned handler: Handler does not
+			// populate named wildcards, so h.ServeHTTP would make every
+			// r.PathValue("user") read as the empty string.
+			mux.ServeHTTP(w, r)
 			return
 		}
-		// The router answers both a path miss and a method miss with an empty
-		// pattern, so the wrapper cannot tell the two apart from the return
-		// values alone: a method miss must fall through to the router's own
-		// 405 (text/plain with Allow, like every other maddy endpoint), a path
-		// miss to the JSON envelope. Probe the methods this endpoint registers
-		// to decide which miss it is.
+		// A method miss and a path miss look the same from here (both report an
+		// empty pattern); ask the mux whether some other registered method
+		// matches this path to tell them apart.
 		probe := *r
-		for _, m := range []string{http.MethodGet, http.MethodPost} {
+		for m := range methods {
 			if m == r.Method {
 				continue
 			}
 			probe.Method = m
 			if _, p := mux.Handler(&probe); p != "" {
-				h.ServeHTTP(w, r)
+				mux.ServeHTTP(w, r)
 				return
 			}
 		}

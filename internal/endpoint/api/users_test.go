@@ -49,6 +49,11 @@ func TestUsersList(t *testing.T) {
 	if err := u.(*fakeUser).SetMessageLimit(&limit); err != nil {
 		t.Fatal(err)
 	}
+	// The test's own fetch must be released too, so the gets/logouts balance
+	// below covers it.
+	if err := u.Logout(); err != nil {
+		t.Fatal(err)
+	}
 	// carol exists in creds only.
 	if err := e.creds.CreateUser("carol@example.org", "xoxoxoxo"); err != nil {
 		t.Fatal(err)
@@ -78,5 +83,24 @@ func TestUsersList(t *testing.T) {
 	}
 	if !res.Users[1].Storage || *res.Users[1].Appendlimit != 1024 {
 		t.Fatal("bob's applitmit must be reported")
+	}
+
+	// Every account the handler borrowed from the store must be released.
+	fs := e.store.(*fakeStorage)
+	fs.mu.Lock()
+	gets := fs.gets
+	accts := make([]*fakeUser, 0, len(fs.accts))
+	for _, u := range fs.accts {
+		accts = append(accts, u)
+	}
+	fs.mu.Unlock()
+	logouts := 0
+	for _, u := range accts {
+		u.mu.Lock()
+		logouts += u.logouts
+		u.mu.Unlock()
+	}
+	if gets != logouts {
+		t.Fatalf("leaked account objects: %d GetIMAPAcct, %d Logout", gets, logouts)
 	}
 }
