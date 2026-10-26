@@ -158,13 +158,32 @@ func (r *rateLimiter) Allow(key string) bool {
 		}
 	}
 	if len(kept) == 0 {
-		// ponytail: quiet keys are forgotten on their next touch, so a key
-		// never seen again stays in the map — bounded by the number of distinct
-		// client IPs, not by the window. Upgrade path: a periodic sweep
-		// goroutine if the published port sees high IP churn.
+		// Forget keys whose window has passed, so the map is bounded by the
+		// number of clients active inside one window rather than by the number
+		// of client IPs ever seen (the port can be published).
 		delete(r.attempts, key)
 	} else {
 		r.attempts[key] = kept
+	}
+	// ponytail: prune-on-touch only forgets keys that come back, and a flood
+	// of distinct source IPs, one request each, is exactly the shape that
+	// never comes back; a full sweep past 4096 keys keeps the map bounded
+	// regardless. Upgrade path: a periodic sweep goroutine if 4096 is hit in
+	// practice.
+	if len(r.attempts) > 4096 {
+		for k, ts := range r.attempts {
+			live := ts[:0]
+			for _, t := range ts {
+				if now.Sub(t) < r.window {
+					live = append(live, t)
+				}
+			}
+			if len(live) == 0 {
+				delete(r.attempts, k)
+				continue
+			}
+			r.attempts[k] = live
+		}
 	}
 	if len(kept) >= r.max {
 		return false

@@ -218,17 +218,17 @@ func TestTokenSurvivesNewEndpoint(t *testing.T) {
 
 func TestRateLimiterForgetsQuietKeys(t *testing.T) {
 	r := newRateLimiter(2, 30*time.Millisecond)
-	for i := 0; i < 200; i++ {
-		r.Allow("10.0.0." + strconv.Itoa(i))
+	// Past the sweep threshold, so the final Allow must exercise both
+	// prune-on-touch (the window expiry) and the full sweep (the quiet keys).
+	for i := 0; i < 4100; i++ {
+		r.Allow("10.0." + strconv.Itoa(i/256) + "." + strconv.Itoa(i%256))
 	}
 	time.Sleep(45 * time.Millisecond)
-	// A key whose window has passed is allowed again, and its stale attempts
-	// are forgotten when the key is touched.
 	if !r.Allow("10.0.0.1") {
 		t.Fatal("window must expire")
 	}
-	if n := len(r.attempts["10.0.0.1"]); n != 1 {
-		t.Fatalf("stale attempts must be forgotten on touch, %d left", n)
+	if n := len(r.attempts); n != 1 {
+		t.Fatalf("quiet keys must be forgotten, %d entries left", n)
 	}
 }
 
