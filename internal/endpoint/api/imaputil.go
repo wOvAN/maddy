@@ -29,6 +29,7 @@ import (
 	imapbackend "github.com/emersion/go-imap/backend"
 	mess "github.com/foxcpp/go-imap-mess"
 	imapsql "github.com/foxcpp/go-imap-sql"
+	"github.com/foxcpp/maddy/framework/log"
 	"github.com/foxcpp/maddy/framework/module"
 )
 
@@ -93,8 +94,9 @@ func statusForStoreError(err error) int {
 // not depend on the close alone: a producer that returns without closing would
 // pin this handler goroutine forever, and EarlyStop's drain would never finish.
 // The done channel makes the producer's return end the loop, and the recover is
-// this repo's rule for any goroutine a module starts (api.go:255).
-func fetchMessages(mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet, items []imap.FetchItem) ([]*imap.Message, error) {
+// this repo's rule for any goroutine a module starts (api.go:255), paired there
+// with a log line, so a recovered panic is logged, not just answered.
+func fetchMessages(l *log.Logger, mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet, items []imap.FetchItem) ([]*imap.Message, error) {
 	ch := make(chan *imap.Message, 32)
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -102,6 +104,7 @@ func fetchMessages(mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet, items [
 		defer close(done)
 		defer func() {
 			if p := recover(); p != nil {
+				l.Error("message fetch panicked", fmt.Errorf("%v", p))
 				errCh <- fmt.Errorf("message fetch panicked: %v", p)
 			}
 		}()
@@ -135,13 +138,18 @@ func fetchMessages(mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet, items [
 
 // drainBody concatenates the fetched body literals, reading at most
 // max+1 bytes: a result longer than max is the truncation signal, so a
-// truncated body never reaches the client as if it were complete. Reading
-// through the literal (not around it) is what abandons no producer.
-func drainBody(msg *imap.Message, max int64) []byte {
+// truncated body never reaches the client as if it were complete. The read
+// error is returned, not dropped: go-imap-sql hands out a live literal over
+// the decompressed extStore blob (fetch.go:230-251), so the read can fail
+// mid-body, and a failed read is a 500, not a 200 with a prefix.
+func drainBody(msg *imap.Message, max int64) ([]byte, error) {
 	var out []byte
 	for _, lit := range msg.Body {
-		b, _ := io.ReadAll(io.LimitReader(lit, max+1))
+		b, err := io.ReadAll(io.LimitReader(lit, max+1))
+		if err != nil {
+			return out, err
+		}
 		out = append(out, b...)
 	}
-	return out
+	return out, nil
 }

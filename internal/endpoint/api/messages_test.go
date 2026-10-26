@@ -217,6 +217,18 @@ func TestMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// A literal that fails mid-read — go-imap-sql hands out a live literal
+	// over the decompressed extStore blob (fetch.go:230-251), so the read can
+	// die partway — is a read failure, not a 200 serving a prefix of the body
+	// as if it were the message.
+	fu.failBodyAt = 4
+	rec = do(t, e, "GET", base+"/2", tok, "")
+	fu.failBodyAt = 0
+	if rec.Code != http.StatusInternalServerError ||
+		!strings.Contains(rec.Body.String(), "read message body") {
+		t.Fatalf("body read failure: code %d: %s", rec.Code, rec.Body.String())
+	}
+
 	// A producer that returns without closing ch must not pin the handler
 	// goroutine (EarlyStop's drain in Task 10 depends on every request
 	// returning): drive the contract-violating producer 20 times and demand
@@ -230,5 +242,13 @@ func TestMessages(t *testing.T) {
 	}
 	fu.listNoClose = false
 
+	// Every mailbox handle the handlers borrowed was closed, so a dropped
+	// defer mb.Close() goes red here as Logout does for accounts.
+	fu.mu.Lock()
+	opens, closes := fu.opens, fu.closes
+	fu.mu.Unlock()
+	if opens != closes {
+		t.Fatalf("leaked mailbox handles: %d GetMailbox, %d Close", opens, closes)
+	}
 	assertAccountBalance(t, e)
 }

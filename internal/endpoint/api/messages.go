@@ -69,7 +69,7 @@ func (e *Endpoint) handleMsgsList(w http.ResponseWriter, r *http.Request) {
 
 	set := &imap.SeqSet{}
 	set.AddRange(1, 0) // 1:* — all messages, as "maddy imap-msgs list" defaults to
-	fetched, err := fetchMessages(mb, true, set, []imap.FetchItem{
+	fetched, err := fetchMessages(e.log, mb, true, set, []imap.FetchItem{
 		imap.FetchUid, imap.FetchFlags, imap.FetchInternalDate,
 		imap.FetchRFC822Size, imap.FetchEnvelope,
 	})
@@ -132,14 +132,23 @@ func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = mb.Close() }()
 
-	fetched, err := fetchMessages(mb, true, seqset(uid), []imap.FetchItem{imap.FetchRFC822})
+	fetched, err := fetchMessages(e.log, mb, true, seqset(uid), []imap.FetchItem{imap.FetchRFC822})
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to read message", err.Error(), nil)
 		return
 	}
 	var body []byte
 	for _, msg := range fetched {
-		body = drainBody(msg, e.maxMsgSize)
+		var err error
+		body, err = drainBody(msg, e.maxMsgSize)
+		if err != nil {
+			// The literal failed mid-read (a corrupt/missing extStore blob
+			// surfaces here, go-imap-sql fetch.go:230-251); a 200 with a
+			// prefix of the body would report a read failure as a complete
+			// message.
+			writeErr(w, http.StatusInternalServerError, "failed to read message body", err.Error(), nil)
+			return
+		}
 	}
 	if int64(len(body)) > e.maxMsgSize {
 		// The literal did not fit the cap, so body is a truncation of it;

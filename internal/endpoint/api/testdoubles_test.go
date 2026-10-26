@@ -259,6 +259,15 @@ type fakeUser struct {
 	// (go-imap backend/mailbox.go:29): it sends one message, returns an
 	// error and leaves ch open. false by default.
 	listNoClose bool
+	// failBodyAt makes the RFC822 literal of every listed message fail after
+	// n bytes, modelling a live literal over a decompressed extStore blob
+	// (go-imap-sql fetch.go:230-251) whose read fails mid-body. 0 by default.
+	failBodyAt int
+	// opens/closes balance mailbox handles: every GetMailbox hand-out must be
+	// matched by a Close, so a handler that drops its defer goes red in the
+	// test that checks the pair (like assertAccountBalance does for accounts).
+	opens  int
+	closes int
 	// logouts counts Logout calls so a handler that borrows an account and
 	// forgets to release it fails the suite (see fakeStorage.gets).
 	logouts int
@@ -319,6 +328,9 @@ func (u *fakeUser) ListMailboxes(subscribed bool) ([]imap.MailboxInfo, error) {
 func (u *fakeUser) GetMailbox(name string, readOnly bool, conn imapbackend.Conn) (*imap.MailboxStatus, imapbackend.Mailbox, error) {
 	u.mu.Lock()
 	_, ok := u.mboxes[name]
+	if ok {
+		u.opens++
+	}
 	u.mu.Unlock()
 	if !ok {
 		return nil, nil, imapbackend.ErrNoSuchMailbox
@@ -464,8 +476,33 @@ type fakeMailbox struct {
 	name string
 }
 
-func (m *fakeMailbox) Name() string              { return m.name }
-func (m *fakeMailbox) Close() error              { return nil }
+// partialLiteral is an imap.Literal that reads n bytes of body and then
+// fails — the live-literal-over-a-dying-blob shape of go-imap-sql's fetch.
+type partialLiteral struct {
+	r    *bytes.Reader
+	fail int
+	got  int
+}
+
+func (l *partialLiteral) Read(p []byte) (int, error) {
+	if l.got >= l.fail {
+		return 0, errors.New("body literal failed mid-read")
+	}
+	n, err := l.r.Read(p)
+	l.got += n
+	return n, err
+}
+
+func (l *partialLiteral) Len() int { return l.r.Len() }
+
+func (m *fakeMailbox) Name() string { return m.name }
+
+func (m *fakeMailbox) Close() error {
+	m.user.mu.Lock()
+	defer m.user.mu.Unlock()
+	m.user.closes++
+	return nil
+}
 func (m *fakeMailbox) Poll(expunge bool) error   { return nil }
 func (m *fakeMailbox) Expunge() error            { return nil }
 func (m *fakeMailbox) Idle(done <-chan struct{}) {}
@@ -500,8 +537,12 @@ func (m *fakeMailbox) ListMessages(uid bool, set *imap.SeqSet, items []imap.Fetc
 			case imap.FetchEnvelope:
 				out.Envelope = &msg.env
 			case imap.FetchRFC822:
+				lit := imap.Literal(literal{bytes.NewReader(msg.body)})
+				if m.user.failBodyAt > 0 {
+					lit = &partialLiteral{r: bytes.NewReader(msg.body), fail: m.user.failBodyAt}
+				}
 				out.Body = map[*imap.BodySectionName]imap.Literal{
-					&imap.BodySectionName{}: literal{bytes.NewReader(msg.body)},
+					&imap.BodySectionName{}: lit,
 				}
 			}
 		}
