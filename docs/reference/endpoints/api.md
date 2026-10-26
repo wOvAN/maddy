@@ -138,7 +138,7 @@ backend compares them case-sensitively. The hierarchy separator is `.`, so
 | `POST /api/v1/users/{user}/mailboxes` | `{name, special_use?}` | `201` `{name}` |
 | `PUT /api/v1/users/{user}/mailboxes/{mbox}` | `{new_name}` | `200` `{name:"<new name>", moved}` |
 | `DELETE /api/v1/users/{user}/mailboxes/{mbox}` | – | `200` `{deleted:"<mbox>", messages, left_behind}` |
-| `GET /api/v1/users/{user}/mailboxes/{mbox}/messages` | – | `200` `{messages:[...]}` |
+| `GET /api/v1/users/{user}/mailboxes/{mbox}/messages` | – | `200` `{messages:[...], truncated}` |
 | `POST /api/v1/users/{user}/mailboxes/{mbox}/messages` | `{raw, flags?, date?}` | `201` `{mailbox, uid}` |
 | `GET /api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}` | – | `200` raw RFC 822 body, `application/rfc822+text` |
 | `DELETE /api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}` | – | `200` `{uid, deleted:<count>}` |
@@ -173,7 +173,10 @@ without per-account APPENDLIMIT, and for an account whose state the endpoint
 could not read (that failure is logged, not reported).
 
 `POST /api/v1/users` requires a full address and a password of at least 8
-characters, and answers `409` if the address exists in either store. With
+characters, and answers `409` if the address exists in either store.
+`appendlimit` is accepted only together with `storage:true`; on a creds-only
+create it is a `400` naming that reason, because the credential half has no
+per-account APPENDLIMIT to apply it to. With
 `storage` true it creates the credential, then the IMAP account, then the five
 special-use folders (`Sent`, `Trash`, `Junk`, `Drafts`, `Archive`), then applies
 `appendlimit`. There is no transaction between the two stores, so a failure at
@@ -231,7 +234,10 @@ rename succeeds and INBOX keeps existing. Deleting `INBOX` is refused with `400`
 
 ## Messages
 
-`GET .../messages` lists the whole mailbox by UID. Each entry carries `uid`,
+`GET .../messages` lists the whole mailbox by UID. The list is capped at 1000
+entries; when the mailbox holds more, the answer is the first 1000 in store
+order and `truncated` is `true` — the list is a prefix, there is no paging
+parameter. Each entry carries `uid`,
 `seq`, `flags`, `size`, `internal_date` (arrival) and, when the backend returned
 an envelope, `date` (sent), `subject`, `from`, `to`, `cc`, `bcc`, `message_id`,
 `in_reply_to`; an entry without an envelope omits those eight keys, and absent

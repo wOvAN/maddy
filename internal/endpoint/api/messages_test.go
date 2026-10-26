@@ -24,11 +24,94 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/emersion/go-imap"
 )
 
 func itoa(v uint32) string { return strconv.FormatUint(uint64(v), 10) }
+
+// TestMessagesListTruncated pins the bound on the whole-mailbox list: at most
+// maxListMessages entries are answered, the rest of the mailbox is reported by
+// the truncated flag, and the fetch is still drained to the end (a consumer
+// that stopped at the cap would leave the producer blocked on the full
+// channel, the hazard the done-channel dance exists to survive).
+func TestMessagesListTruncated(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+	fs := e.store.(*fakeStorage)
+	if err := fs.CreateIMAPAcct("bob@example.org"); err != nil {
+		t.Fatal(err)
+	}
+	fu := fs.acct("bob@example.org")
+	const base = "/api/v1/users/bob@example.org/mailboxes/INBOX/messages"
+
+	// More than the cap plus the fetch channel's buffer (32): a consumer that
+	// returned at the cap instead of draining would leave the producer
+	// blocked mid-fetch, and this test's producer-completion wait goes red.
+	for i := 0; i < maxListMessages+40; i++ {
+		fu.plant("INBOX", imap.Envelope{Subject: "x"}, "body")
+	}
+	// The producer-completion signal is armed for the request below, so the
+	// test can demand that ListMessages ran over all 1002 messages.
+	fu.produced = make(chan struct{})
+
+	rec := do(t, e, "GET", base, tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: code %d: %s", rec.Code, rec.Body.String())
+	}
+	select {
+	case <-fu.produced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the capped fetch must keep draining to the producer's end")
+	}
+	// The signal is one-shot (the producer closes it); disarm it before the
+	// next request, under the lock the producer holds while reading it.
+	fu.mu.Lock()
+	fu.produced = nil
+	fu.mu.Unlock()
+
+	var list struct {
+		Messages  []json.RawMessage `json:"messages"`
+		Truncated bool              `json:"truncated"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Messages) != maxListMessages || !list.Truncated {
+		t.Fatalf("list must be a truncated prefix: %d entries, truncated %v",
+			len(list.Messages), list.Truncated)
+	}
+
+	// Under the cap the flag is false, so the client can tell a whole list
+	// from a prefix.
+	fu.mu.Lock()
+	fu.mboxes["INBOX"] = fu.mboxes["INBOX"][:maxListMessages]
+	fu.mu.Unlock()
+	rec = do(t, e, "GET", base, tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list at cap: code %d: %s", rec.Code, rec.Body.String())
+	}
+	list = struct {
+		Messages  []json.RawMessage `json:"messages"`
+		Truncated bool              `json:"truncated"`
+	}{}
+	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Messages) != maxListMessages || list.Truncated {
+		t.Fatalf("a mailbox at the cap is not truncated: %d entries, truncated %v",
+			len(list.Messages), list.Truncated)
+	}
+
+	fu.mu.Lock()
+	opens, closes := fu.opens, fu.closes
+	fu.mu.Unlock()
+	if opens != closes {
+		t.Fatalf("leaked mailbox handles: %d GetMailbox, %d Close", opens, closes)
+	}
+	assertAccountBalance(t, e)
+}
 
 func TestMessages(t *testing.T) {
 	e := loginEndpoint(t)

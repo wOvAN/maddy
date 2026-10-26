@@ -162,6 +162,43 @@ func TestUsersCreateNormalizesUsername(t *testing.T) {
 	}
 }
 
+func TestUsersCreateAppendlimitNeedsStorage(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+
+	// The creds-only path returns before reading req.Appendlimit, so a
+	// request carrying the limit there used to get a 201, no limit and no
+	// signal. The refusal must name the reason and create nothing.
+	for _, body := range []string{
+		`{"username":"dave@example.org","password":"pppppppppp","appendlimit":1024}`,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":false,"appendlimit":1024}`,
+	} {
+		rec := do(t, e, "POST", "/api/v1/users", tok, body)
+		if rec.Code != http.StatusBadRequest ||
+			!strings.Contains(rec.Body.String(), "appendlimit requires storage:true") {
+			t.Fatalf("%s: code %d: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	if err := e.creds.AuthPlain("dave@example.org", "pppppppppp"); !errors.Is(err, module.ErrUnknownCredentials) {
+		t.Fatal("a refused create must not leave a credential")
+	}
+
+	// storage:true with appendlimit must still be accepted and applied.
+	rec := do(t, e, "POST", "/api/v1/users", tok,
+		`{"username":"dave@example.org","password":"pppppppppp","storage":true,"appendlimit":1024}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("code %d: %s", rec.Code, rec.Body.String())
+	}
+	u, err := e.store.GetIMAPAcct("dave@example.org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = u.Logout() }()
+	if lim := u.(*fakeUser).CreateMessageLimit(); lim == nil || *lim != 1024 {
+		t.Fatalf("appendlimit not applied: %v", lim)
+	}
+}
+
 func TestUsersCreateConflict(t *testing.T) {
 	e := loginEndpoint(t)
 	tok := login(t, e, "admin@example.org", "hunter2hunter2")

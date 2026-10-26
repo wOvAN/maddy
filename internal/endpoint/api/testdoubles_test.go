@@ -268,6 +268,11 @@ type fakeUser struct {
 	// test that checks the pair (like assertAccountBalance does for accounts).
 	opens  int
 	closes int
+	// produced, when non-nil, is closed when ListMessages returns: a test can
+	// then prove the producer ran the fetch to its end, which is what the
+	// list cap must preserve (returning at the cap would leave the producer
+	// blocked on the full channel and never reach this close).
+	produced chan struct{}
 	// logouts counts Logout calls so a handler that borrows an account and
 	// forgets to release it fails the suite (see fakeStorage.gets).
 	logouts int
@@ -520,6 +525,11 @@ func (m *fakeMailbox) Info() (*imap.MailboxInfo, error) {
 func (m *fakeMailbox) ListMessages(uid bool, set *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
 	m.user.mu.Lock()
 	defer m.user.mu.Unlock()
+	// Signal producer completion (see fakeUser.produced) on every return
+	// path, contract-breaking ones included.
+	if m.user.produced != nil {
+		defer close(m.user.produced)
+	}
 	// listNoClose: send one message, return an error, leave ch open — a
 	// producer that breaks the close contract, to prove the consumer
 	// survives it.

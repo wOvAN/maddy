@@ -69,10 +69,10 @@ func (e *Endpoint) handleMsgsList(w http.ResponseWriter, r *http.Request) {
 
 	set := &imap.SeqSet{}
 	set.AddRange(1, 0) // 1:* — all messages, as "maddy imap-msgs list" defaults to
-	fetched, err := fetchMessages(e.log, mb, true, set, []imap.FetchItem{
+	fetched, truncated, err := fetchMessages(e.log, mb, true, set, []imap.FetchItem{
 		imap.FetchUid, imap.FetchFlags, imap.FetchInternalDate,
 		imap.FetchRFC822Size, imap.FetchEnvelope,
-	})
+	}, maxListMessages)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to list messages", err.Error(), nil)
 		return
@@ -108,7 +108,7 @@ func (e *Endpoint) handleMsgsList(w http.ResponseWriter, r *http.Request) {
 		}
 		msgs = append(msgs, entry)
 	}
-	writeJSON(w, http.StatusOK, map[string]interface{}{"messages": msgs})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"messages": msgs, "truncated": truncated})
 }
 
 func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
@@ -132,7 +132,9 @@ func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = mb.Close() }()
 
-	fetched, err := fetchMessages(e.log, mb, true, seqset(uid), []imap.FetchItem{imap.FetchRFC822})
+	// One uid, no list cap: the fetch is bounded by the set, not by
+	// maxListMessages.
+	fetched, _, err := fetchMessages(e.log, mb, true, seqset(uid), []imap.FetchItem{imap.FetchRFC822}, 0)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to read message", err.Error(), nil)
 		return

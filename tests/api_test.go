@@ -181,7 +181,7 @@ func TestAPIAccountManagement(tt *testing.T) {
 	// (the CLI subcommand it replaces is not part of this surface).
 	resp, body = do(http.MethodGet, msgsPath, tok.Token, nil)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.JSONEq(t, `{"messages":[]}`, string(body))
+	require.JSONEq(t, `{"messages":[],"truncated":false}`, string(body))
 
 	// Deleting through the API removes both halves.
 	resp, _ = do(http.MethodDelete, "/api/v1/users/new@maddy.test", tok.Token, nil)

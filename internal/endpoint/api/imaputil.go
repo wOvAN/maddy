@@ -89,6 +89,12 @@ func statusForStoreError(err error) int {
 	}
 }
 
+// maxListMessages bounds the whole-mailbox list route: a 1:* fetch
+// materialises every envelope in the mailbox and this endpoint runs inside the
+// process that serves mail, so one large mailbox must not be able to OOM the
+// server on a panel page load.
+const maxListMessages = 1000
+
 // fetchMessages runs a message fetch to completion. The backend owns ch
 // (go-imap backend/mailbox.go:29), so the consumer must not close it — and must
 // not depend on the close alone: a producer that returns without closing would
@@ -96,7 +102,14 @@ func statusForStoreError(err error) int {
 // The done channel makes the producer's return end the loop, and the recover is
 // this repo's rule for any goroutine a module starts (api.go:255), paired there
 // with a log line, so a recovered panic is logged, not just answered.
-func fetchMessages(l *log.Logger, mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet, items []imap.FetchItem) ([]*imap.Message, error) {
+//
+// max bounds the result: the first max messages are collected and the rest are
+// drained and dropped, with truncated reporting the drop (max <= 0 means no
+// bound). The drain must run to the producer's close in that case too —
+// returning at the cap leaves the producer blocked on the full channel, which
+// is the hazard the done-channel dance exists to survive.
+func fetchMessages(l *log.Logger, mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet,
+	items []imap.FetchItem, max int) ([]*imap.Message, bool, error) {
 	ch := make(chan *imap.Message, 32)
 	errCh := make(chan error, 1)
 	done := make(chan struct{})
@@ -112,24 +125,33 @@ func fetchMessages(l *log.Logger, mb imapbackend.Mailbox, byUID bool, set *imap.
 	}()
 
 	var msgs []*imap.Message
+	received := 0
+	collect := func(msg *imap.Message) {
+		received++
+		if max <= 0 || len(msgs) < max {
+			msgs = append(msgs, msg)
+		}
+	}
+	truncated := func() bool { return max > 0 && received > max }
+
 	for {
 		select {
 		case msg, ok := <-ch:
 			if ok {
-				msgs = append(msgs, msg)
+				collect(msg)
 				continue
 			}
-			return msgs, <-errCh // the producer closed ch
+			return msgs, truncated(), <-errCh // the producer closed ch
 		case <-done:
 			for { // producer returned; take what is buffered, never block on ch
 				select {
 				case msg, ok := <-ch:
 					if !ok {
-						return msgs, <-errCh
+						return msgs, truncated(), <-errCh
 					}
-					msgs = append(msgs, msg)
+					collect(msg)
 				default:
-					return msgs, <-errCh
+					return msgs, truncated(), <-errCh
 				}
 			}
 		}

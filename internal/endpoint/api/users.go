@@ -166,6 +166,14 @@ func (e *Endpoint) handleUsersCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// appendlimit is a property of the IMAP account; the creds-only path below
+	// never reads it, so a client that sends it there gets a 201, no limit and
+	// no signal. Refuse the combination instead of dropping the field.
+	if req.Appendlimit != nil && (req.Storage == nil || !*req.Storage) {
+		writeErr(w, http.StatusBadRequest, "appendlimit requires storage:true", "", nil)
+		return
+	}
+
 	if exists, err := e.userExists(username); err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to look up user", err.Error(), nil)
 		return
