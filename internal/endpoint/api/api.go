@@ -61,6 +61,8 @@ type Endpoint struct {
 	loginWindow time.Duration
 	maxMsgSize  int64
 
+	limiter *rateLimiter
+
 	listenersWg sync.WaitGroup
 	serv        http.Server
 	startTime   time.Time
@@ -127,6 +129,10 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 		e.endpoints = append(e.endpoints, endp)
 	}
 
+	// The limiter must exist before the first request, not before handler():
+	// the routes only read e.limiter at request time.
+	e.limiter = newRateLimiter(e.loginLimit, e.loginWindow)
+
 	e.serv.Handler = e.handler()
 	e.serv.ReadHeaderTimeout = 10 * time.Second
 	return nil
@@ -134,6 +140,13 @@ func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
 
 func (e *Endpoint) handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/login", e.handleLogin)
+	mux.HandleFunc("GET /api/v1/health", e.handleHealth)
+	// Stub behind the middleware so the auth surface is live from day one;
+	// the real user listing lands with the user management endpoints.
+	mux.HandleFunc("GET /api/v1/users", e.requireAdmin(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"users": []string{}})
+	}))
 	return mux
 }
 
