@@ -19,13 +19,24 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package api
 
 import (
+	imap "github.com/emersion/go-imap"
 	imapbackend "github.com/emersion/go-imap/backend"
-	imapsql "github.com/foxcpp/go-imap-sql"
 )
 
-// deleteMessages mirrors "maddy imap-msgs remove": deleting messages is a
-// go-imap-sql specific capability, reached by the same type assertion on the
-// selected mailbox that internal/cli/ctl/imap.go:625 uses.
+// deleter is the go-imap-sql Mailbox capability to delete messages; the CLI
+// reaches it by asserting the concrete type on the selected mailbox
+// (mbox.(*imapsql.Mailbox), internal/cli/ctl/imap.go:628). Asserting the
+// method set is the same reachability test on every real mailbox, and it lets
+// the test double speak it.
+type deleter interface {
+	DelMessages(uid bool, seq *imap.SeqSet) error
+}
+
+// deleteMessages mirrors "maddy imap-msgs remove". The CLI opens the mailbox
+// read-only (GetMailbox's readOnly=true, imap.go:617 — the flag drives \Seen
+// marking in ListMessages, go-imap-sql fetch.go:22, and Close on a management
+// handle is a no-op); we open it read-write because the mutation is not a read,
+// and the flag is harmless here precisely because DelMessages ignores it.
 func (e *Endpoint) deleteMessages(u imapbackend.User, mbox string, uid uint32) error {
 	_, mb, err := u.GetMailbox(mbox, false, nil)
 	if err != nil {
@@ -33,9 +44,9 @@ func (e *Endpoint) deleteMessages(u imapbackend.User, mbox string, uid uint32) e
 	}
 	defer func() { _ = mb.Close() }()
 
-	mbSQL, ok := mb.(*imapsql.Mailbox)
+	d, ok := mb.(deleter)
 	if !ok {
 		return errUnsupported
 	}
-	return mbSQL.DelMessages(true, seqset(uid))
+	return d.DelMessages(true, seqset(uid))
 }

@@ -21,10 +21,13 @@ package api
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/emersion/go-imap"
 	imapbackend "github.com/emersion/go-imap/backend"
+	mess "github.com/foxcpp/go-imap-mess"
 	imapsql "github.com/foxcpp/go-imap-sql"
 	"github.com/foxcpp/maddy/framework/module"
 )
@@ -66,14 +69,79 @@ func statusForStoreError(err error) int {
 	switch {
 	case errors.Is(err, imapbackend.ErrNoSuchMailbox),
 		errors.Is(err, imapsql.ErrUserDoesntExists),
-		errors.Is(err, module.ErrUnknownCredentials):
+		errors.Is(err, module.ErrUnknownCredentials),
+		// A uid set that matched nothing (go-imap-mess ResolveSeq,
+		// mailbox.go:41,55); DelMessages propagates it, so "delete a uid
+		// that is not there" is this arm.
+		errors.Is(err, mess.ErrNoMessages):
 		return http.StatusNotFound
 	case errors.Is(err, imapbackend.ErrMailboxAlreadyExists):
 		return http.StatusConflict
 	case errors.Is(err, errUnmanageable), errors.Is(err, errUnsupported),
 		errors.Is(err, imapsql.ErrUnsupportedSpecialAttr):
 		return http.StatusNotImplemented
+	// APPENDLIMIT exceeded on append (go-imap-sql mailbox.go:368-381).
+	case errors.Is(err, imapbackend.ErrTooBig):
+		return http.StatusRequestEntityTooLarge
 	default:
 		return http.StatusInternalServerError
 	}
+}
+
+// fetchMessages runs a message fetch to completion. The backend owns ch
+// (go-imap backend/mailbox.go:29), so the consumer must not close it — and must
+// not depend on the close alone: a producer that returns without closing would
+// pin this handler goroutine forever, and EarlyStop's drain would never finish.
+// The done channel makes the producer's return end the loop, and the recover is
+// this repo's rule for any goroutine a module starts (api.go:255).
+func fetchMessages(mb imapbackend.Mailbox, byUID bool, set *imap.SeqSet, items []imap.FetchItem) ([]*imap.Message, error) {
+	ch := make(chan *imap.Message, 32)
+	errCh := make(chan error, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if p := recover(); p != nil {
+				errCh <- fmt.Errorf("message fetch panicked: %v", p)
+			}
+		}()
+		errCh <- mb.ListMessages(byUID, set, items, ch)
+	}()
+
+	var msgs []*imap.Message
+	for {
+		select {
+		case msg, ok := <-ch:
+			if ok {
+				msgs = append(msgs, msg)
+				continue
+			}
+			return msgs, <-errCh // the producer closed ch
+		case <-done:
+			for { // producer returned; take what is buffered, never block on ch
+				select {
+				case msg, ok := <-ch:
+					if !ok {
+						return msgs, <-errCh
+					}
+					msgs = append(msgs, msg)
+				default:
+					return msgs, <-errCh
+				}
+			}
+		}
+	}
+}
+
+// drainBody concatenates the fetched body literals, reading at most
+// max+1 bytes: a result longer than max is the truncation signal, so a
+// truncated body never reaches the client as if it were complete. Reading
+// through the literal (not around it) is what abandons no producer.
+func drainBody(msg *imap.Message, max int64) []byte {
+	var out []byte
+	for _, lit := range msg.Body {
+		b, _ := io.ReadAll(io.LimitReader(lit, max+1))
+		out = append(out, b...)
+	}
+	return out
 }

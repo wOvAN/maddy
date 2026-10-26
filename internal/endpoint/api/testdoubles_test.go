@@ -29,6 +29,7 @@ import (
 
 	imap "github.com/emersion/go-imap"
 	imapbackend "github.com/emersion/go-imap/backend"
+	mess "github.com/foxcpp/go-imap-mess"
 	imapsql "github.com/foxcpp/go-imap-sql"
 	"github.com/foxcpp/maddy/framework/module"
 )
@@ -254,6 +255,10 @@ type fakeUser struct {
 	limit   *uint32
 	// mboxErr makes CreateMailboxSpecial fail on purpose; nil by default.
 	mboxErr error
+	// listNoClose models a ListMessages that breaks the close contract
+	// (go-imap backend/mailbox.go:29): it sends one message, returns an
+	// error and leaves ch open. false by default.
+	listNoClose bool
 	// logouts counts Logout calls so a handler that borrows an account and
 	// forgets to release it fails the suite (see fakeStorage.gets).
 	logouts int
@@ -262,6 +267,7 @@ type fakeUser struct {
 var (
 	_ imapbackend.User    = (*fakeUser)(nil)
 	_ imapbackend.Mailbox = (*fakeMailbox)(nil)
+	_ deleter             = (*fakeMailbox)(nil)
 )
 
 // newFakeUser seeds INBOX the way go-imap-sql does on CreateUser.
@@ -282,7 +288,11 @@ func (u *fakeUser) Status(mbox string, items []imap.StatusItem) (*imap.MailboxSt
 	if !ok {
 		return nil, imapbackend.ErrNoSuchMailbox
 	}
-	return &imap.MailboxStatus{Name: mbox, Messages: uint32(len(msgs))}, nil
+	// UidNext is the next uid to be assigned; the double numbers uids from
+	// 1, so it is one past the message count (the append handler reports
+	// UidNext-1 as the created uid).
+	return &imap.MailboxStatus{Name: mbox, Messages: uint32(len(msgs)),
+		UidNext: uint32(len(msgs)) + 1}, nil
 }
 
 func (u *fakeUser) SetSubscribed(mbox string, subscribed bool) error { return nil }
@@ -411,6 +421,11 @@ func (u *fakeUser) CreateMessage(mbox string, flags []string, date time.Time, bo
 	if err != nil {
 		return err
 	}
+	// Faithful to go-imap-sql checkAppendLimit (mailbox.go:368-381): a body
+	// strictly over the per-user APPENDLIMIT is refused with ErrTooBig.
+	if u.limit != nil && len(b) > int(*u.limit) {
+		return imapbackend.ErrTooBig
+	}
 	uid := uint32(1)
 	for _, m := range msgs {
 		if m.uid >= uid {
@@ -466,9 +481,14 @@ func (m *fakeMailbox) Info() (*imap.MailboxInfo, error) {
 }
 
 func (m *fakeMailbox) ListMessages(uid bool, set *imap.SeqSet, items []imap.FetchItem, ch chan<- *imap.Message) error {
-	defer close(ch)
 	m.user.mu.Lock()
 	defer m.user.mu.Unlock()
+	// listNoClose: send one message, return an error, leave ch open — a
+	// producer that breaks the close contract, to prove the consumer
+	// survives it.
+	if !m.user.listNoClose {
+		defer close(ch)
+	}
 	for _, msg := range m.user.mboxes[m.name] {
 		if !set.Contains(msg.uid) {
 			continue
@@ -486,7 +506,32 @@ func (m *fakeMailbox) ListMessages(uid bool, set *imap.SeqSet, items []imap.Fetc
 			}
 		}
 		ch <- out
+		if m.user.listNoClose {
+			return errors.New("producer returned without closing ch")
+		}
 	}
+	return nil
+}
+
+// DelMessages is faithful to go-imap-sql's DelMessages: a hard delete of the
+// matched set (mark, read ids, DELETE FROM msgs, sql.go:504-526) and
+// mess.ErrNoMessages when the set matches nothing (go-imap-mess
+// mailbox.go:41,55,95).
+func (m *fakeMailbox) DelMessages(uid bool, seq *imap.SeqSet) error {
+	m.user.mu.Lock()
+	defer m.user.mu.Unlock()
+	msgs := m.user.mboxes[m.name]
+	kept := msgs[:0]
+	for _, msg := range msgs {
+		if seq.Contains(msg.uid) {
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	if len(kept) == len(msgs) {
+		return mess.ErrNoMessages
+	}
+	m.user.mboxes[m.name] = kept
 	return nil
 }
 

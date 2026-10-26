@@ -30,12 +30,25 @@ import (
 	imapbackend "github.com/emersion/go-imap/backend"
 )
 
-func (e *Endpoint) mailboxFor(u imapbackend.User, name string) (*imap.MailboxStatus, imapbackend.Mailbox, error) {
-	status, mb, err := u.GetMailbox(name, true, nil)
+// parseUIDParam reads the {uid} path value. uid 0 is refused, not forwarded:
+// go-imap-mess's ResolveSeq rewrites a zero bound of a UID sequence set to the
+// mailbox's highest UID (handle.uidMap[len-1], mailbox.go:60-65), so a
+// pass-through 0 makes GET .../messages/0 read the newest message and
+// DELETE .../messages/0 hard-delete it — a destructive wildcard. 0 is a
+// reserved sentinel in responses ("the store would not say", see the append
+// uid); input 0 is refused. Keep them coherent.
+func parseUIDParam(w http.ResponseWriter, r *http.Request) (uint32, bool) {
+	uid, err := strconv.ParseUint(r.PathValue("uid"), 10, 32)
 	if err != nil {
-		return nil, nil, err
+		writeErr(w, http.StatusBadRequest, "uid must be a number", "", nil)
+		return 0, false
 	}
-	return status, mb, nil
+	if uid == 0 {
+		writeErr(w, http.StatusBadRequest, "uid must be greater than zero",
+			"uid 0 resolves to the newest message", nil)
+		return 0, false
+	}
+	return uint32(uid), true
 }
 
 func (e *Endpoint) handleMsgsList(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +60,7 @@ func (e *Endpoint) handleMsgsList(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = u.Logout() }()
 
-	_, mb, err := e.mailboxFor(u, mbox)
+	_, mb, err := u.GetMailbox(mbox, true, nil)
 	if err != nil {
 		writeErr(w, statusForStoreError(err), "failed to open mailbox", err.Error(), nil)
 		return
@@ -56,50 +69,52 @@ func (e *Endpoint) handleMsgsList(w http.ResponseWriter, r *http.Request) {
 
 	set := &imap.SeqSet{}
 	set.AddRange(1, 0) // 1:* — all messages, as "maddy imap-msgs list" defaults to
-	ch := make(chan *imap.Message, 32)
-	errCh := make(chan error, 1)
-	go func() {
-		// The backend owns the close ("when the function returns, ch must be
-		// closed", backend/mailbox.go) — go-imap-sql and the test double both
-		// close it; a close here panics. Same shape as internal/cli/ctl/imap.go:747.
-		errCh <- mb.ListMessages(true, set, []imap.FetchItem{
-			imap.FetchUid, imap.FetchFlags, imap.FetchInternalDate,
-			imap.FetchRFC822Size, imap.FetchEnvelope,
-		}, ch)
-	}()
-
-	var msgs []map[string]interface{}
-	for msg := range ch {
-		entry := map[string]interface{}{
-			"uid":   msg.Uid,
-			"seq":   msg.SeqNum,
-			"flags": msg.Flags,
-			"size":  msg.Size,
-			"date":  msg.InternalDate,
-		}
-		if msg.Envelope != nil {
-			entry["subject"] = msg.Envelope.Subject
-			entry["date"] = msg.Envelope.Date
-			entry["from"] = addresses(msg.Envelope.From)
-			entry["to"] = addresses(msg.Envelope.To)
-		}
-		msgs = append(msgs, entry)
-	}
-	if err := <-errCh; err != nil {
+	fetched, err := fetchMessages(mb, true, set, []imap.FetchItem{
+		imap.FetchUid, imap.FetchFlags, imap.FetchInternalDate,
+		imap.FetchRFC822Size, imap.FetchEnvelope,
+	})
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to list messages", err.Error(), nil)
 		return
 	}
-	if msgs == nil {
-		msgs = []map[string]interface{}{}
+
+	msgs := make([]map[string]interface{}, 0, len(fetched))
+	for _, msg := range fetched {
+		flags := msg.Flags
+		if flags == nil {
+			flags = []string{}
+		}
+		// "date" is the envelope date (when the message was sent) and
+		// "internal_date" the arrival date, the pair "maddy imap-msgs list"
+		// prints (internal/cli/ctl/imap.go:770-795); a list fetch always
+		// carries the envelope, so one shared "date" key was the arrival
+		// date only in name.
+		entry := map[string]interface{}{
+			"uid":           msg.Uid,
+			"seq":           msg.SeqNum,
+			"flags":         flags,
+			"size":          msg.Size,
+			"internal_date": msg.InternalDate,
+		}
+		if msg.Envelope != nil {
+			entry["date"] = msg.Envelope.Date
+			entry["subject"] = msg.Envelope.Subject
+			entry["from"] = addresses(msg.Envelope.From)
+			entry["to"] = addresses(msg.Envelope.To)
+			entry["cc"] = addresses(msg.Envelope.Cc)
+			entry["bcc"] = addresses(msg.Envelope.Bcc)
+			entry["message_id"] = msg.Envelope.MessageId
+			entry["in_reply_to"] = msg.Envelope.InReplyTo
+		}
+		msgs = append(msgs, entry)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"messages": msgs})
 }
 
 func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
 	username, mbox := r.PathValue("user"), r.PathValue("mbox")
-	uid, err := strconv.ParseUint(r.PathValue("uid"), 10, 32)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "uid must be a number", "", nil)
+	uid, ok := parseUIDParam(w, r)
+	if !ok {
 		return
 	}
 
@@ -110,32 +125,26 @@ func (e *Endpoint) handleMsgsGet(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = u.Logout() }()
 
-	_, mb, err := e.mailboxFor(u, mbox)
+	_, mb, err := u.GetMailbox(mbox, true, nil)
 	if err != nil {
 		writeErr(w, statusForStoreError(err), "failed to open mailbox", err.Error(), nil)
 		return
 	}
 	defer func() { _ = mb.Close() }()
 
-	ch := make(chan *imap.Message, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- mb.ListMessages(true, seqset(uint32(uid)), []imap.FetchItem{imap.FetchRFC822}, ch)
-	}()
-
-	var body []byte
-	for msg := range ch {
-		for _, lit := range msg.Body {
-			b, err := io.ReadAll(io.LimitReader(lit, e.maxMsgSize))
-			if err != nil {
-				writeErr(w, http.StatusInternalServerError, "failed to read message body", err.Error(), nil)
-				return
-			}
-			body = b
-		}
-	}
-	if err := <-errCh; err != nil {
+	fetched, err := fetchMessages(mb, true, seqset(uid), []imap.FetchItem{imap.FetchRFC822})
+	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "failed to read message", err.Error(), nil)
+		return
+	}
+	var body []byte
+	for _, msg := range fetched {
+		body = drainBody(msg, e.maxMsgSize)
+	}
+	if int64(len(body)) > e.maxMsgSize {
+		// The literal did not fit the cap, so body is a truncation of it;
+		// never report a truncated body as the complete message.
+		writeErr(w, http.StatusRequestEntityTooLarge, "message exceeds max_msg_size", "", nil)
 		return
 	}
 	if body == nil {
@@ -154,6 +163,16 @@ func (e *Endpoint) handleMsgsAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mbox := r.PathValue("mbox")
+	// A max-size raw string full of quotes inflates to ~2x of JSON and blows
+	// the decoder's +64 KiB headroom, so the post-decode length check is
+	// unreachable for it — the decode fails on syntax first and the client
+	// gets a 400 for an oversized body. Refuse on the transport length
+	// (which httptest/net/http populate, -1 for chunked) before decoding;
+	// this is also the cap on the per-request decode allocation.
+	if r.ContentLength > e.maxMsgSize+1<<16 {
+		writeErr(w, http.StatusRequestEntityTooLarge, "message exceeds max_msg_size", "", nil)
+		return
+	}
 	var req struct {
 		Flags []string `json:"flags"`
 		Date  string   `json:"date"`
@@ -161,6 +180,12 @@ func (e *Endpoint) handleMsgsAppend(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, e.maxMsgSize+1<<16)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
+		return
+	}
+	if req.Raw == "" {
+		// "maddy imap-msgs append" refuses an empty body ("Empty message,
+		// refusing to continue", internal/cli/ctl/imap.go:571).
+		writeErr(w, http.StatusBadRequest, "raw is required", "", nil)
 		return
 	}
 	if int64(len(req.Raw)) > e.maxMsgSize {
@@ -190,9 +215,28 @@ func (e *Endpoint) handleMsgsAppend(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, statusForStoreError(err), "failed to append message", err.Error(), nil)
 		return
 	}
-	e.log.Msg("message appended", "user", username, "mailbox", mbox,
+	// Report the uid the message got, the CLI's instrument: it prints
+	// Status(mbox).UidNext after the append (internal/cli/ctl/imap.go:574,584),
+	// and UidNext-1 is the uid just assigned. 0 means "appended, the
+	// store would not say" — the reserved sentinel parseUIDParam refuses as
+	// input.
+	var created uint32
+	if st, err := u.Status(mbox, []imap.StatusItem{imap.StatusUidNext}); err == nil && st.UidNext > 0 {
+		created = st.UidNext - 1
+	}
+	e.log.Msg("message appended", "user", username, "mailbox", mbox, "uid", created,
 		"admin", ctxAdminUser(r.Context()))
-	writeJSON(w, http.StatusCreated, map[string]interface{}{"mailbox": mbox})
+	writeJSON(w, http.StatusCreated, map[string]interface{}{"mailbox": mbox, "uid": created})
+}
+
+// msgCount reads the mailbox's message count; ok=false means the store would
+// not say.
+func msgCount(u imapbackend.User, mbox string) (uint32, bool) {
+	st, err := u.Status(mbox, []imap.StatusItem{imap.StatusMessages})
+	if err != nil {
+		return 0, false
+	}
+	return st.Messages, true
 }
 
 func (e *Endpoint) handleMsgsDelete(w http.ResponseWriter, r *http.Request) {
@@ -202,9 +246,8 @@ func (e *Endpoint) handleMsgsDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mbox := r.PathValue("mbox")
-	uid, err := strconv.ParseUint(r.PathValue("uid"), 10, 32)
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "uid must be a number", "", nil)
+	uid, ok := parseUIDParam(w, r)
+	if !ok {
 		return
 	}
 
@@ -215,15 +258,32 @@ func (e *Endpoint) handleMsgsDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = u.Logout() }()
 
+	// DelMessages reports no count and, on go-imap-sql, a uid that is not
+	// present is a silent success (ResolveSeq's uid branch does no membership
+	// check, markUid marks zero rows, delMarked deletes them,
+	// go-imap-sql sql.go:504-526), so the response must report the
+	// destruction, not the request: count the mailbox before and after, the
+	// Status pair the CLI reads after a mutation (imap.go:574-584). deleted=0
+	// with a 200 means "the store would not say, or nothing matched". The
+	// delete is HARD: rows are marked, their ids read and DELETE FROM msgs
+	// runs, plus the extStore blob — EXPUNGE, irrecoverable.
+	before, known := msgCount(u, mbox)
+
 	// Deleting messages interrupts active IMAP sessions, exactly as the CLI
 	// subcommand warns.
-	if err := e.deleteMessages(u, mbox, uint32(uid)); err != nil {
+	if err := e.deleteMessages(u, mbox, uid); err != nil {
 		e.log.Msg("message delete failed", "user", username, "mailbox", mbox, "uid", uid,
 			"admin", ctxAdminUser(r.Context()), "error", err.Error())
 		writeErr(w, statusForStoreError(err), "failed to delete message", err.Error(), nil)
 		return
 	}
+	var deleted uint32
+	if known {
+		if after, ok := msgCount(u, mbox); ok && before > after {
+			deleted = before - after
+		}
+	}
 	e.log.Msg("message deleted", "user", username, "mailbox", mbox, "uid", uid,
-		"admin", ctxAdminUser(r.Context()))
-	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": uid})
+		"deleted", deleted, "admin", ctxAdminUser(r.Context()))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"uid": uid, "deleted": deleted})
 }

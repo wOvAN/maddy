@@ -33,28 +33,37 @@ func itoa(v uint32) string { return strconv.FormatUint(uint64(v), 10) }
 func TestMessages(t *testing.T) {
 	e := loginEndpoint(t)
 	tok := login(t, e, "admin@example.org", "hunter2hunter2")
-	if err := e.store.(*fakeStorage).CreateIMAPAcct("bob@example.org"); err != nil {
+	fs := e.store.(*fakeStorage)
+	if err := fs.CreateIMAPAcct("bob@example.org"); err != nil {
 		t.Fatal(err)
 	}
-	u, _ := e.store.GetIMAPAcct("bob@example.org")
-	fu := u.(*fakeUser)
+	// acct, not GetIMAPAcct: a test-side grab must not count against
+	// assertAccountBalance, which measures handler leaks only.
+	fu := fs.acct("bob@example.org")
+	const base = "/api/v1/users/bob@example.org/mailboxes/INBOX/messages"
 
 	// One message already in the mailbox, with an envelope to report.
 	fu.plant("INBOX", imap.Envelope{Subject: "hi",
-		From: []*imap.Address{{PersonalName: "Alice", MailboxName: "alice", HostName: "example.org"}}},
+		MessageId: "<m1@example.org>", InReplyTo: "<m0@example.org>",
+		From: []*imap.Address{{PersonalName: "Alice", MailboxName: "alice", HostName: "example.org"}},
+		Cc:   []*imap.Address{{MailboxName: "carol", HostName: "example.org"}}},
 		"From: alice@example.org\r\nSubject: hi\r\n\r\nbody\r\n")
 
-	rec := do(t, e, "GET", "/api/v1/users/bob@example.org/mailboxes/INBOX/messages", tok, "")
+	rec := do(t, e, "GET", base, tok, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("list: code %d: %s", rec.Code, rec.Body.String())
 	}
 	var list struct {
 		Messages []struct {
-			UID     uint32   `json:"uid"`
-			Flags   []string `json:"flags"`
-			Size    uint32   `json:"size"`
-			Subject string   `json:"subject"`
-			From    []string `json:"from"`
+			UID          uint32   `json:"uid"`
+			Flags        []string `json:"flags"`
+			Size         uint32   `json:"size"`
+			Subject      string   `json:"subject"`
+			From         []string `json:"from"`
+			CC           []string `json:"cc"`
+			MessageID    string   `json:"message_id"`
+			InReplyTo    string   `json:"in_reply_to"`
+			InternalDate string   `json:"internal_date"`
 		} `json:"messages"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &list); err != nil {
@@ -63,13 +72,32 @@ func TestMessages(t *testing.T) {
 	if len(list.Messages) != 1 {
 		t.Fatalf("messages: %s", rec.Body.String())
 	}
-	if list.Messages[0].Subject != "hi" || list.Messages[0].Size == 0 ||
-		len(list.Messages[0].From) != 1 || list.Messages[0].From[0] != "alice@example.org" {
+	m := list.Messages[0]
+	if m.Subject != "hi" || m.Size == 0 ||
+		len(m.From) != 1 || m.From[0] != "alice@example.org" {
 		t.Fatalf("envelope: %s", rec.Body.String())
 	}
-	uid := list.Messages[0].UID
+	// The CLI prints the whole envelope; the route must not drop the rest of
+	// it, and "date" must stop being the arrival date's alias.
+	if len(m.CC) != 1 || m.CC[0] != "carol@example.org" ||
+		m.MessageID != "<m1@example.org>" || m.InReplyTo != "<m0@example.org>" ||
+		m.InternalDate == "" {
+		t.Fatalf("envelope fields: %s", rec.Body.String())
+	}
+	uid := m.UID
 
-	rec = do(t, e, "GET", "/api/v1/users/bob@example.org/mailboxes/INBOX/messages/"+itoa(uid), tok, "")
+	// A flag-less message serialises flags as [], like the empty list does.
+	var rawList struct {
+		Messages []map[string]interface{} `json:"messages"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &rawList); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := rawList.Messages[0]["flags"].([]interface{}); !ok {
+		t.Fatalf("flags must serialise as [], not null: %s", rec.Body.String())
+	}
+
+	rec = do(t, e, "GET", base+"/"+itoa(uid), tok, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("get: code %d: %s", rec.Code, rec.Body.String())
 	}
@@ -80,31 +108,127 @@ func TestMessages(t *testing.T) {
 		t.Fatalf("content type: %s", ct)
 	}
 
-	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes/INBOX/messages", tok,
+	// uid 0 is a destructive wildcard (go-imap-mess ResolveSeq rewrites a
+	// zero uid bound to the mailbox's highest uid, mailbox.go:60-65): it must
+	// never reach the store, on the read path or the destructive one.
+	rec = do(t, e, "GET", base+"/0", tok, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("get uid 0: code %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, e, "DELETE", base+"/0", tok, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("delete uid 0: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, e, "POST", base, tok,
 		`{"flags":["\\Seen"],"date":"2026-10-26T10:00:00Z","raw":"From: b@example.org\r\n\r\nsecond\r\n"}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("append: code %d: %s", rec.Code, rec.Body.String())
+	}
+	// The append reports the uid it created (Status UidNext-1, the CLI's
+	// instrument), not just the mailbox it was told about.
+	var app struct {
+		Mailbox string `json:"mailbox"`
+		UID     uint32 `json:"uid"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &app); err != nil {
+		t.Fatal(err)
+	}
+	if app.Mailbox != "INBOX" || app.UID != 2 {
+		t.Fatalf("append must report the created uid: %s", rec.Body.String())
 	}
 	if len(fu.mboxes["INBOX"]) != 2 {
 		t.Fatalf("message not appended: %d", len(fu.mboxes["INBOX"]))
 	}
 
-	rec = do(t, e, "GET", "/api/v1/users/bob@example.org/mailboxes/INBOX/messages/99999", tok, "")
+	// An empty message is refused, as the CLI refuses it (imap.go:569-571).
+	rec = do(t, e, "POST", base, tok, `{"raw":""}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "raw is required") {
+		t.Fatalf("empty append: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	rec = do(t, e, "GET", base+"/99999", tok, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing message: code %d", rec.Code)
 	}
 
-	// The fake storage is not go-imap-sql, so EXPUNGE-style deletion is not
-	// available; the same route deletes for real on a go-imap-sql backend,
-	// which tests/api_test.go covers.
-	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/INBOX/messages/"+itoa(uid), tok, "")
-	if rec.Code != http.StatusNotImplemented {
-		t.Fatalf("delete on a non-imapsql backend: code %d", rec.Code)
+	rec = do(t, e, "DELETE", base+"/"+itoa(uid), tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: code %d: %s", rec.Code, rec.Body.String())
+	}
+	// The delete reports the destruction, not the request: two messages were
+	// in the mailbox, one is gone.
+	var del struct {
+		UID     uint32 `json:"uid"`
+		Deleted uint32 `json:"deleted"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &del); err != nil {
+		t.Fatal(err)
+	}
+	if del.UID != uid || del.Deleted != 1 {
+		t.Fatalf("delete must report what it removed: %s", rec.Body.String())
+	}
+	if len(fu.mboxes["INBOX"]) != 1 {
+		t.Fatalf("message not deleted: %d", len(fu.mboxes["INBOX"]))
+	}
+
+	// A uid that is not there is a 404 (mess.ErrNoMessages), not a 200
+	// claiming a deletion that destroyed nothing.
+	rec = do(t, e, "DELETE", base+"/99999", tok, "")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("delete of a missing message: code %d: %s", rec.Code, rec.Body.String())
 	}
 
 	big := `{"raw":"` + strings.Repeat("a", 32*1024*1024+1) + `"}`
-	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes/INBOX/messages", tok, big)
+	rec = do(t, e, "POST", base, tok, big)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize append: code %d", rec.Code)
 	}
+
+	// Escaped quotes inflate the JSON to ~2x the raw length, past the
+	// decoder's headroom, so the transport-length precheck is what answers
+	// 413 here; without it the decode dies on syntax and the client gets 400.
+	bigEsc := `{"raw":"` + strings.Repeat(`\"`, 16*1024*1024+40000) + `"}`
+	rec = do(t, e, "POST", base, tok, bigEsc)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize escaped append: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// A body over the cap must never be served truncated as if complete:
+	// the fetch reads maxMsgSize+1 and the cap being hit is a 413.
+	e.maxMsgSize = 8
+	rec = do(t, e, "GET", base+"/2", tok, "")
+	e.maxMsgSize = 32 * 1024 * 1024
+	if rec.Code != http.StatusRequestEntityTooLarge ||
+		!strings.Contains(rec.Body.String(), "max_msg_size") {
+		t.Fatalf("oversize get: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// APPENDLIMIT exceeded on append is the store's ErrTooBig, a 413.
+	limit := uint32(4)
+	if err := fu.SetMessageLimit(&limit); err != nil {
+		t.Fatal(err)
+	}
+	rec = do(t, e, "POST", base, tok, `{"raw":"12345"}`)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("appendlimit: code %d: %s", rec.Code, rec.Body.String())
+	}
+	if err := fu.SetMessageLimit(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// A producer that returns without closing ch must not pin the handler
+	// goroutine (EarlyStop's drain in Task 10 depends on every request
+	// returning): drive the contract-violating producer 20 times and demand
+	// an answer every time.
+	fu.listNoClose = true
+	for i := 0; i < 20; i++ {
+		rec = do(t, e, "GET", base, tok, "")
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("unclosed producer: code %d: %s", rec.Code, rec.Body.String())
+		}
+	}
+	fu.listNoClose = false
+
+	assertAccountBalance(t, e)
 }
