@@ -50,6 +50,7 @@ type Endpoint struct {
 
 	listenersWg sync.WaitGroup
 	serv        http.Server
+	startTime   time.Time
 }
 
 func New(c *container.C, _ string, args []string) (container.LifetimeModule, error) {
@@ -114,6 +115,7 @@ func (e *Endpoint) Start() error {
 			}
 		}()
 	}
+	e.startTime = time.Now()
 	return nil
 }
 
