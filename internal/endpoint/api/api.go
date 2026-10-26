@@ -35,10 +35,13 @@ import (
 	"time"
 
 	"github.com/foxcpp/maddy/framework/config"
+	modconfig "github.com/foxcpp/maddy/framework/config/module"
 	"github.com/foxcpp/maddy/framework/container"
 	"github.com/foxcpp/maddy/framework/log"
+	"github.com/foxcpp/maddy/framework/module"
 	"github.com/foxcpp/maddy/framework/module/modules"
 	"github.com/foxcpp/maddy/framework/resource/netresource"
+	"github.com/foxcpp/maddy/internal/authz"
 )
 
 const modName = "api"
@@ -47,6 +50,16 @@ type Endpoint struct {
 	addrs     []string
 	endpoints []config.Endpoint
 	log       *log.Logger
+
+	creds     module.PlainUserDB
+	store     module.Storage
+	admins    map[string]struct{}
+	secret    []byte
+	normalize authz.NormalizeFunc
+
+	loginLimit  int
+	loginWindow time.Duration
+	maxMsgSize  int64
 
 	listenersWg sync.WaitGroup
 	serv        http.Server
@@ -61,9 +74,41 @@ func New(c *container.C, _ string, args []string) (container.LifetimeModule, err
 }
 
 func (e *Endpoint) Configure(_ []string, cfg *config.Map) error {
+	var adminsList []string
+	var secretStr string
+
+	cfg.Custom("creds", false, false, nil, func(m *config.Map, node config.Node) (interface{}, error) {
+		var creds module.PlainUserDB
+		if err := modconfig.ModuleFromNode("auth", node.Args, node, m.Globals, &creds); err != nil {
+			return nil, err
+		}
+		return creds, nil
+	}, &e.creds)
+	cfg.Custom("storage", false, false, nil, modconfig.StorageDirective, &e.store)
+	cfg.StringList("admins", false, true, nil, &adminsList)
+	cfg.String("secret", false, true, "", &secretStr)
+	cfg.Int("login_rate_limit", false, false, 10, &e.loginLimit)
+	cfg.Duration("login_rate_window", false, false, 5*time.Minute, &e.loginWindow)
+	cfg.DataSize("max_msg_size", false, false, 32*1024*1024, &e.maxMsgSize)
+	cfg.Bool("debug", true, false, &e.log.Debug)
+
 	if _, err := cfg.Process(); err != nil {
 		return err
 	}
+
+	// creds/storage are checked in Start, not here, so that the module can be
+	// configured in unit tests without building a module registry.
+	if len(adminsList) == 0 {
+		return fmt.Errorf("%s: admins must list at least one administrator", modName)
+	}
+	if len(secretStr) < 16 {
+		return fmt.Errorf("%s: secret must be at least 16 bytes", modName)
+	}
+	e.normalize = authz.NormalizeAuto
+	if err := e.setAdmins(adminsList); err != nil {
+		return err
+	}
+	e.secret = []byte(secretStr)
 
 	for _, a := range e.addrs {
 		endp, err := config.ParseEndpoint(a)
@@ -86,11 +131,36 @@ func (e *Endpoint) handler() http.Handler {
 	return mux
 }
 
+func (e *Endpoint) setAdmins(list []string) error {
+	e.admins = make(map[string]struct{}, len(list))
+	for _, a := range list {
+		normalized, err := e.normalize(a)
+		if err != nil {
+			return fmt.Errorf("%s: malformed administrator address: %v", modName, err)
+		}
+		e.admins[normalized] = struct{}{}
+	}
+	return nil
+}
+
+func (e *Endpoint) isAdmin(username string) bool {
+	normalized, err := e.normalize(username)
+	if err != nil {
+		return false
+	}
+	_, ok := e.admins[normalized]
+	return ok
+}
+
 func (e *Endpoint) Name() string { return modName }
 
 func (e *Endpoint) InstanceName() string { return "" }
 
 func (e *Endpoint) Start() error {
+	if e.creds == nil || e.store == nil {
+		return fmt.Errorf("%s: creds and storage directives are required", modName)
+	}
+
 	for _, endp := range e.endpoints {
 		l, err := netresource.Listen(endp.Network(), endp.Address())
 		if err != nil {

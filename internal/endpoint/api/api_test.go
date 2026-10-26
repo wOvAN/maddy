@@ -66,9 +66,21 @@ func newTestEndpoint(addr string) (*Endpoint, error) {
 		return nil, err
 	}
 	endp := lm.(*Endpoint)
-	cfg := config.NewMap(nil, config.Node{Name: "api", Args: []string{"api", "tcp://" + addr}})
+	node := config.Node{
+		Name: "api",
+		Args: []string{"api", "tcp://" + addr},
+		Children: []config.Node{
+			{Name: "admins", Args: []string{"admin@example.org"}},
+			{Name: "secret", Args: []string{"0123456789abcdef0123456789abcdef"}},
+		},
+	}
+	cfg := config.NewMap(nil, node)
 	if err := endp.Configure(nil, cfg); err != nil {
 		return nil, err
 	}
+	// Start refuses to serve without module instances; tests inject the fakes
+	// because the registry is not available in unit tests.
+	endp.creds = newFakeCreds()
+	endp.store = newFakeStorage()
 	return endp, nil
 }
