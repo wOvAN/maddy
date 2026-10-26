@@ -38,7 +38,7 @@ func TestEndpointServes(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := l.Addr().(*net.TCPAddr).String()
-	l.Close()
+	_ = l.Close()
 
 	endp, err := newTestEndpoint(addr)
 	if err != nil {
@@ -57,7 +57,7 @@ func TestEndpointServes(t *testing.T) {
 	if err != nil {
 		t.Fatal("nothing is listening after Start:", err)
 	}
-	conn.Close()
+	_ = conn.Close()
 }
 
 func TestEarlyStopDrainsRequests(t *testing.T) {
@@ -68,7 +68,7 @@ func TestEarlyStopDrainsRequests(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := l.Addr().(*net.TCPAddr).String()
-	l.Close()
+	_ = l.Close()
 
 	e, err := newTestEndpoint(addr)
 	if err != nil {
@@ -92,7 +92,7 @@ func TestEarlyStopDrainsRequests(t *testing.T) {
 			done <- -1
 			return
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		done <- resp.StatusCode
 	}()
 

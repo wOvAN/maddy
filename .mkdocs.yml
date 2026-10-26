@@ -29,6 +29,7 @@ nav:
           - reference/endpoints/imap.md
           - reference/endpoints/smtp.md
           - reference/endpoints/openmetrics.md
+          - reference/endpoints/api.md
       - IMAP storage:
           - reference/storage/imap-filters.md
           - reference/storage/imapsql.md
