@@ -21,6 +21,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -62,10 +63,58 @@ func TestMailboxes(t *testing.T) {
 		t.Fatalf("duplicate create: code %d", rec.Code)
 	}
 
+	// A malformed body and a missing field are different 400s, like the user
+	// routes answer them.
+	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok, `{nope`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "malformed request body") {
+		t.Fatalf("malformed body: code %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok, `{}`)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "name is required") {
+		t.Fatalf("missing field: code %d: %s", rec.Code, rec.Body.String())
+	}
+
 	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/mailboxes/Mailing%20Lists", tok,
 		`{"new_name":"Lists"}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("rename: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Renaming onto an existing name is a 409, not the 500 a bare
+	// UNIQUE(uid, name) violation would be against go-imap-sql.
+	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/mailboxes/Lists", tok,
+		`{"new_name":"INBOX"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("rename onto existing: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// INBOX cannot be deleted; go-imap-sql refuses it with a bare error that
+	// would reach the client as a 500.
+	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/INBOX", tok, "")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("delete INBOX: code %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// A name containing a literal "/" is reachable only percent-encoded:
+	// ServeMux matches the escaped path and PathValue unescapes it.
+	rec = do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok, `{"name":"Foo/Bar"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create Foo/Bar: code %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, e, "PUT", "/api/v1/users/bob@example.org/mailboxes/Foo%2FBar", tok,
+		`{"new_name":"Baz/Qux"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rename Foo/Bar: code %d: %s", rec.Code, rec.Body.String())
+	}
+	// The raw-slash form of the same path is not a route: the table cannot
+	// match across "/".
+	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/Baz/Qux", tok, "")
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "no such endpoint") {
+		t.Fatalf("raw slash form: code %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/Baz%2FQux", tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete Baz/Qux: code %d: %s", rec.Code, rec.Body.String())
 	}
 
 	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/Lists", tok, "")
@@ -81,5 +130,124 @@ func TestMailboxes(t *testing.T) {
 	rec = do(t, e, "GET", "/api/v1/users/ghost@example.org/mailboxes", tok, "")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("missing user: code %d", rec.Code)
+	}
+
+	assertAccountBalance(t, e)
+}
+
+// TestMailboxHierarchy pins the go-imap-sql semantics the doubles mirror: a
+// rename cascades to the children (renameMboxChilds) and a delete removes
+// exactly one row, so a parent's children survive its deletion.
+func TestMailboxHierarchy(t *testing.T) {
+	e := loginEndpoint(t)
+	tok := login(t, e, "admin@example.org", "hunter2hunter2")
+	if err := e.store.(*fakeStorage).CreateIMAPAcct("bob@example.org"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range []string{"A", "A.B", "A.B.C"} {
+		rec := do(t, e, "POST", "/api/v1/users/bob@example.org/mailboxes", tok,
+			`{"name":"`+name+`"}`)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("create %s: code %d: %s", name, rec.Code, rec.Body.String())
+		}
+	}
+
+	rec := do(t, e, "PUT", "/api/v1/users/bob@example.org/mailboxes/A", tok, `{"new_name":"C"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("rename: code %d: %s", rec.Code, rec.Body.String())
+	}
+	var res struct {
+		Name  string `json:"name"`
+		Moved int    `json:"moved"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Name != "C" || res.Moved != 2 {
+		t.Fatalf("rename must report the children it moved: %+v", res)
+	}
+	if names := mboxNames(t, e, tok); !sameNames(names, []string{"C", "C.B", "C.B.C", "INBOX"}) {
+		t.Fatalf("after rename: %v", names)
+	}
+
+	rec = do(t, e, "DELETE", "/api/v1/users/bob@example.org/mailboxes/C", tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: code %d: %s", rec.Code, rec.Body.String())
+	}
+	var del struct {
+		Deleted    string `json:"deleted"`
+		Messages   uint32 `json:"messages"`
+		LeftBehind int    `json:"left_behind"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &del); err != nil {
+		t.Fatal(err)
+	}
+	if del.Deleted != "C" || del.LeftBehind != 2 {
+		t.Fatalf("delete must report the children it left behind: %+v", del)
+	}
+	if names := mboxNames(t, e, tok); !sameNames(names, []string{"C.B", "C.B.C", "INBOX"}) {
+		t.Fatalf("after delete: %v", names)
+	}
+
+	assertAccountBalance(t, e)
+}
+
+// mboxNames lists the user's mailbox names in the order the store reports them.
+func mboxNames(t *testing.T, e *Endpoint, tok string) []string {
+	t.Helper()
+	rec := do(t, e, "GET", "/api/v1/users/bob@example.org/mailboxes", tok, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list: code %d: %s", rec.Code, rec.Body.String())
+	}
+	var res struct {
+		Mailboxes []struct {
+			Name string `json:"name"`
+		} `json:"mailboxes"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(res.Mailboxes))
+	for _, m := range res.Mailboxes {
+		names = append(names, m.Name)
+	}
+	return names
+}
+
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// assertAccountBalance fails the suite if an account object was borrowed from
+// the store and not released with Logout: every GetIMAPAcct hand-out
+// (fakeStorage.gets) must be matched by a Logout (fakeUser.logouts), so a
+// mailbox handler that drops its defer goes red here.
+func assertAccountBalance(t *testing.T, e *Endpoint) {
+	t.Helper()
+	fs := e.store.(*fakeStorage)
+	fs.mu.Lock()
+	gets := fs.gets
+	accts := make([]*fakeUser, 0, len(fs.accts))
+	for _, u := range fs.accts {
+		accts = append(accts, u)
+	}
+	fs.mu.Unlock()
+	logouts := 0
+	for _, u := range accts {
+		u.mu.Lock()
+		logouts += u.logouts
+		u.mu.Unlock()
+	}
+	if gets != logouts {
+		t.Fatalf("leaked account objects: %d GetIMAPAcct, %d Logout", gets, logouts)
 	}
 }

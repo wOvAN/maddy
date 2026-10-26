@@ -22,6 +22,10 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
+
+	imap "github.com/emersion/go-imap"
+	imapbackend "github.com/emersion/go-imap/backend"
 )
 
 func (e *Endpoint) handleMboxesList(w http.ResponseWriter, r *http.Request) {
@@ -52,12 +56,20 @@ func (e *Endpoint) handleMboxesList(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Endpoint) handleMboxesCreate(w http.ResponseWriter, r *http.Request) {
-	username := r.PathValue("user")
+	username, err := e.normalize(r.PathValue("user"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
 	var req struct {
 		Name       string `json:"name"`
 		SpecialUse string `json:"special_use"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.Name == "" {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
+		return
+	}
+	if req.Name == "" {
 		writeErr(w, http.StatusBadRequest, "name is required", "", nil)
 		return
 	}
@@ -90,7 +102,12 @@ func (e *Endpoint) handleMboxesCreate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (e *Endpoint) handleMboxesDelete(w http.ResponseWriter, r *http.Request) {
-	username, name := r.PathValue("user"), r.PathValue("mbox")
+	username, err := e.normalize(r.PathValue("user"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+	name := r.PathValue("mbox")
 	u, code, err := e.userFor(username)
 	if err != nil {
 		writeErr(w, code, "failed to get IMAP account", err.Error(), nil)
@@ -98,23 +115,53 @@ func (e *Endpoint) handleMboxesDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = u.Logout() }()
 
+	// go-imap-sql refuses this too, with a bare errors.New (user.go:228), which
+	// would reach the client as a 500 for what is a refusal.
+	if strings.EqualFold(name, "INBOX") {
+		e.log.Msg("mailbox delete refused", "user", username, "mailbox", name,
+			"admin", ctxAdminUser(r.Context()))
+		writeErr(w, http.StatusBadRequest, "INBOX cannot be deleted", "", nil)
+		return
+	}
+
+	// Deleting a mailbox destroys its contents and the CLI says so before it
+	// asks (internal/cli/ctl/imap.go:485-516 prints the message count and prompts;
+	// -y skips). A token API has no prompt to port, so it reports the size it is
+	// about to destroy, in the response and in the log the operator audits.
+	var messages uint32
+	if st, err := u.Status(name, []imap.StatusItem{imap.StatusMessages}); err == nil {
+		messages = st.Messages
+	}
+	leftBehind, _ := countChildren(u, name)
+
 	if err := u.DeleteMailbox(name); err != nil {
 		e.log.Msg("mailbox delete failed", "user", username, "mailbox", name,
 			"admin", ctxAdminUser(r.Context()), "error", err.Error())
 		writeErr(w, statusForStoreError(err), "failed to delete mailbox", err.Error(), nil)
 		return
 	}
-	e.log.Msg("mailbox deleted", "user", username, "mailbox", name,
-		"admin", ctxAdminUser(r.Context()))
-	writeJSON(w, http.StatusOK, map[string]interface{}{"deleted": name})
+	e.log.Msg("mailbox deleted", "user", username, "mailbox", name, "messages", messages,
+		"left_behind", leftBehind, "admin", ctxAdminUser(r.Context()))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"deleted": name, "messages": messages, "left_behind": leftBehind,
+	})
 }
 
 func (e *Endpoint) handleMboxesRename(w http.ResponseWriter, r *http.Request) {
-	username, name := r.PathValue("user"), r.PathValue("mbox")
+	username, err := e.normalize(r.PathValue("user"))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed username", err.Error(), nil)
+		return
+	}
+	name := r.PathValue("mbox")
 	var req struct {
 		NewName string `json:"new_name"`
 	}
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil || req.NewName == "" {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "malformed request body", err.Error(), nil)
+		return
+	}
+	if req.NewName == "" {
 		writeErr(w, http.StatusBadRequest, "new_name is required", "", nil)
 		return
 	}
@@ -125,13 +172,57 @@ func (e *Endpoint) handleMboxesRename(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = u.Logout() }()
 
+	// CreateMailbox maps a duplicate onto ErrMailboxAlreadyExists; RenameMailbox
+	// does not — go-imap-sql's rename is a bare UPDATE against a
+	// UNIQUE(uid, name) index (sql.go:140, sql.go:294), so a collision reaches
+	// the client as a 500. Answer the same 409 the create path gives.
+	boxes, err := u.ListMailboxes(false)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "failed to list mailboxes", err.Error(), nil)
+		return
+	}
+	moved := 0
+	prefix := name + "."
+	for _, b := range boxes {
+		if strings.EqualFold(b.Name, req.NewName) {
+			writeErr(w, http.StatusConflict, "mailbox already exists", req.NewName, nil)
+			return
+		}
+		if strings.HasPrefix(b.Name, prefix) {
+			moved++
+		}
+	}
+
 	if err := u.RenameMailbox(name, req.NewName); err != nil {
 		e.log.Msg("mailbox rename failed", "user", username, "mailbox", name,
-			"admin", ctxAdminUser(r.Context()), "error", err.Error())
+			"new_name", req.NewName, "admin", ctxAdminUser(r.Context()), "error", err.Error())
 		writeErr(w, statusForStoreError(err), "failed to rename mailbox", err.Error(), nil)
 		return
 	}
-	e.log.Msg("mailbox renamed", "user", username, "mailbox", name, "to", req.NewName,
-		"admin", ctxAdminUser(r.Context()))
-	writeJSON(w, http.StatusOK, map[string]interface{}{"name": req.NewName})
+	// go-imap-sql cascades a rename to children (renameMboxChilds, user.go:276)
+	// and re-creates an empty INBOX when you rename INBOX (user.go:288), so the
+	// response must not imply one mailbox moved.
+	e.log.Msg("mailbox renamed", "user", username, "mailbox", name, "new_name", req.NewName,
+		"moved", moved, "admin", ctxAdminUser(r.Context()))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name": req.NewName, "moved": moved,
+	})
+}
+
+// countChildren counts the mailboxes under name (go-imap-sql's hierarchy
+// separator is '.', MailboxPathSep in user.go:14, and DeleteMailbox deletes
+// exactly one row, so a parent's children survive its deletion).
+func countChildren(u imapbackend.User, name string) (int, error) {
+	boxes, err := u.ListMailboxes(false)
+	if err != nil {
+		return 0, err
+	}
+	prefix := name + "."
+	n := 0
+	for _, b := range boxes {
+		if strings.HasPrefix(b.Name, prefix) {
+			n++
+		}
+	}
+	return n, nil
 }

@@ -70,7 +70,8 @@ func statusForStoreError(err error) int {
 		return http.StatusNotFound
 	case errors.Is(err, imapbackend.ErrMailboxAlreadyExists):
 		return http.StatusConflict
-	case errors.Is(err, errUnmanageable), errors.Is(err, errUnsupported):
+	case errors.Is(err, errUnmanageable), errors.Is(err, errUnsupported),
+		errors.Is(err, imapsql.ErrUnsupportedSpecialAttr):
 		return http.StatusNotImplemented
 	default:
 		return http.StatusInternalServerError

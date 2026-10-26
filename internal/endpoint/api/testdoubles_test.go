@@ -23,6 +23,7 @@ import (
 	"errors"
 	"io"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -332,6 +333,9 @@ func (u *fakeUser) createMailbox(name, special string) error {
 	return nil
 }
 
+// DeleteMailbox deletes exactly one row, faithful to go-imap-sql's deleteMbox
+// (sql.go:288, DELETE FROM mboxes WHERE uid = ? AND name = ?): the children of
+// a deleted parent are not touched and survive with a dangling prefix.
 func (u *fakeUser) DeleteMailbox(name string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -343,6 +347,11 @@ func (u *fakeUser) DeleteMailbox(name string) error {
 	return nil
 }
 
+// RenameMailbox mirrors go-imap-sql's RenameMailbox (user.go:291): the rename
+// cascades to the children, whose names are rewritten from
+// existingName+MailboxPathSep to newName+MailboxPathSep. The separator is "."
+// (MailboxPathSep, user.go:14) — the "." in this double's names is the real
+// hierarchy separator, so "A.B" is a child of "A".
 func (u *fakeUser) RenameMailbox(existingName, newName string) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -353,8 +362,20 @@ func (u *fakeUser) RenameMailbox(existingName, newName string) error {
 	if _, ok := u.mboxes[newName]; ok {
 		return imapbackend.ErrMailboxAlreadyExists
 	}
+	oldPrefix := existingName + "."
+	newPrefix := newName + "."
+	for name, m := range u.mboxes {
+		if strings.HasPrefix(name, oldPrefix) {
+			delete(u.mboxes, name)
+			u.mboxes[newPrefix+name[len(oldPrefix):]] = m
+		}
+	}
 	u.mboxes[newName] = msgs
 	delete(u.mboxes, existingName)
+	if sp, ok := u.special[existingName]; ok {
+		delete(u.special, existingName)
+		u.special[newName] = sp
+	}
 	return nil
 }
 
