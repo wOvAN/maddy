@@ -73,10 +73,7 @@ func TestAPIAccountManagement(tt *testing.T) {
 	defer t.Close()
 
 	base := "http://127.0.0.1:" + strconv.Itoa(int(t.Port("api")))
-	// Connections must not be pooled across the reload: EarlyStop's Shutdown
-	// closes idle keep-alive connections, and the transport does not re-issue a
-	// POST whose connection the server had already closed, so the first request
-	// after the reload would fail at the socket layer.
+	// This test does not pool connections across the reload.
 	client := &http.Client{
 		Transport: &http.Transport{DisableKeepAlives: true},
 		Timeout:   60 * time.Second,

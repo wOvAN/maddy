@@ -61,9 +61,8 @@ func TestEndpointServes(t *testing.T) {
 }
 
 func TestEarlyStopDrainsRequests(t *testing.T) {
-	// Bind on port 0 through netresource, then read back the real address from
-	// the tracker-owned listener: Start records the endpoint string, which is
-	// what the test dials.
+	// Grab a free port the usual way and hand it to the endpoint: Start binds
+	// exactly this address through netresource, so it is what the test dials.
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -75,8 +74,6 @@ func TestEarlyStopDrainsRequests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.creds, e.store = newFakeCreds(), newFakeStorage()
-	e.limiter = newRateLimiter(10, time.Minute)
 
 	// Replace the mux with a slow handler: EarlyStop must let the running
 	// request finish, while Stop would cut it.
@@ -90,7 +87,7 @@ func TestEarlyStopDrainsRequests(t *testing.T) {
 
 	done := make(chan int, 1)
 	go func() {
-		resp, err := http.Get("http://" + e.listenAddr + "/api/v1/health")
+		resp, err := http.Get("http://" + addr + "/api/v1/health")
 		if err != nil {
 			done <- -1
 			return

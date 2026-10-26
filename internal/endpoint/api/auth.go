@@ -41,12 +41,9 @@ var (
 // anything signed for longer, so the two cannot drift apart.
 const tokenTTL = 12 * time.Hour
 
-// The endpoint is started, reloaded and stopped by the container; assert that
-// contract compiles rather than discovering it at boot.
-var (
-	_ container.LifetimeModule  = &Endpoint{}
-	_ container.EarlyStopModule = &Endpoint{}
-)
+// The endpoint is started and stopped by the container; EarlyStop (api.go)
+// asserts the reload half of the same contract.
+var _ container.LifetimeModule = &Endpoint{}
 
 // makeToken builds a stateless bearer token: base64url(username|exp) and a
 // hex HMAC-SHA256 over exactly that payload.
