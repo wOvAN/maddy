@@ -297,12 +297,11 @@ produce `413` as well.
   reports `go-build`), not from the version string `build.sh` injects into the
   binary. Use it as a liveness probe, not as a version probe.
 - The `api` sublogger logs every failed login at info (successful ones at
-  debug), and every
-  mutating action that succeeded; of the failing ones it logs the storage-layer
-  failures (mailbox, message, password, APPENDLIMIT, incomplete user delete) and
-  a user create that left state behind. A user create that fails and rolls back
-  cleanly, and the create whose existence lookup fails, are not logged; the
-  response is the only record of them.
+  debug), and every mutating action that succeeded; of the failing ones it logs
+  the storage-layer failures (mailbox, message, password, APPENDLIMIT, incomplete
+  user delete) and a user create that left state behind. A user create that fails
+  and rolls back cleanly, and the create whose existence lookup fails, are not
+  logged; the response is the only record of them.
 - The equal-cost login comparison is bcrypt-specific: a login for an address
   with no credential spends one bcrypt comparison so that it takes as long as a
   wrong password. If `creds` is a `pass_table` with a non-bcrypt hash
