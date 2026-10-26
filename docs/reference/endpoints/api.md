@@ -42,8 +42,10 @@ inline module block.
 
 IMAP storage module used for all account, mailbox and message operations. Must
 implement the `Storage` role. Operations that manage accounts
-(user list/create/delete) additionally require `ManageableStorage`; a backend
-that does not implement it answers them with `501`.
+(user list/create/delete) additionally require `ManageableStorage`; against a
+backend that does not implement it, listing and deleting users answer `501`
+while creating a user answers `500`, with its credentials half rolled back and
+listed in `partial`.
 
 ---
 
@@ -129,21 +131,23 @@ backend compares them case-sensitively. The hierarchy separator is `.`, so
 | `GET /api/v1/health` | – | `200` `{version, start_time}` |
 | `GET /api/v1/users` | – | `200` `{users:[{username, creds, storage, appendlimit}]}` |
 | `POST /api/v1/users` | `{username, password, storage?, appendlimit?}` | `201` `{username, creds, storage}` |
-| `DELETE /api/v1/users/{user}` | – | `200` `{deleted:[...]}` |
+| `DELETE /api/v1/users/{user}` | – | `200` `{deleted:["creds","storage"]}` |
 | `PUT /api/v1/users/{user}/password` | `{password}` | `200` `{username}` |
 | `PUT /api/v1/users/{user}/appendlimit` | `{value: 1048576}` / `{value: null}` | `200` `{username, appendlimit}` |
 | `GET /api/v1/users/{user}/mailboxes` | – | `200` `{mailboxes:[{name, special_use?}]}` |
 | `POST /api/v1/users/{user}/mailboxes` | `{name, special_use?}` | `201` `{name}` |
-| `PUT /api/v1/users/{user}/mailboxes/{mbox}` | `{new_name}` | `200` `{name, moved}` |
-| `DELETE /api/v1/users/{user}/mailboxes/{mbox}` | – | `200` `{deleted, messages, left_behind}` |
+| `PUT /api/v1/users/{user}/mailboxes/{mbox}` | `{new_name}` | `200` `{name:"<new name>", moved}` |
+| `DELETE /api/v1/users/{user}/mailboxes/{mbox}` | – | `200` `{deleted:"<mbox>", messages, left_behind}` |
 | `GET /api/v1/users/{user}/mailboxes/{mbox}/messages` | – | `200` `{messages:[...]}` |
 | `POST /api/v1/users/{user}/mailboxes/{mbox}/messages` | `{raw, flags?, date?}` | `201` `{mailbox, uid}` |
 | `GET /api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}` | – | `200` raw RFC 822 body, `application/rfc822+text` |
-| `DELETE /api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}` | – | `200` `{uid, deleted}` |
+| `DELETE /api/v1/users/{user}/mailboxes/{mbox}/messages/{uid}` | – | `200` `{uid, deleted:<count>}` |
 
-Every error answer is `{"error":"...","detail":"..."}`, where `detail` is the
-underlying module error text, plus the route-specific fields listed above where
-they apply. The codes are: `400` malformed request; `401` bad login credentials,
+An error answer is `{"error":"..."}`, carrying `detail` with the underlying
+module error text when the failure came from a module (a login, token, rate
+limit or request-parsing failure has no module error and therefore no `detail`),
+plus the route-specific fields listed above where they apply. The codes are:
+`400` malformed request; `401` bad login credentials,
 or a missing/malformed/expired token; `403` authenticated but not an
 administrator; `404` no such user/mailbox/message; `409` already exists; `413`
 over a size limit; `429` login rate limit exceeded (with `Retry-After`); `500` a
@@ -153,12 +157,19 @@ An unregistered path is
 with a method it does not declare is answered by the router with `405`, an
 `Allow` header and a plain-text body, not the JSON envelope.
 
+Three answers use the key `deleted` with three different meanings: a string (the
+deleted mailbox name) in mailbox delete, an array of store names (`"creds"`,
+`"storage"`) in user delete, and a message count in message delete. Rename's
+`name` is the new name.
+
 ## Users and credentials
 
 `GET /api/v1/users` is the union of the credentials list and the IMAP account
-list; `creds` and `storage` say which half each address exists in, and
-`appendlimit` is its per-account APPENDLIMIT (`null` when unset, and always
-`null` for an address that has no IMAP account).
+list; `creds` and `storage` say which half each address exists in.
+`appendlimit` is the account's per-account APPENDLIMIT; it is `null` for an
+address with no IMAP account, for an account with no limit, for a backend
+without per-account APPENDLIMIT, and for an account whose state the endpoint
+could not read (that failure is logged, not reported).
 
 `POST /api/v1/users` requires a full address and a password of at least 8
 characters, and answers `409` if the address exists in either store. With
@@ -168,25 +179,33 @@ special-use folders (`Sent`, `Trash`, `Junk`, `Drafts`, `Archive`), then applies
 any step after the first rolls back both halves and answers
 
 ```
-500 {"error":"failed to create IMAP account","detail":"...","partial":["creds","storage"]}
+500 {"error":"failed to create IMAP account","detail":"...","partial":[]}
 ```
 
-`partial` lists the stores that still hold a record; an empty array means the
-rollback was clean.
+`partial` lists the stores that still hold a record, so the usual answer is the
+empty array: the rollback removed both halves. A non-empty `partial` (e.g.
+`["storage"]`) says the rollback itself failed and that store kept the record.
+A storage backend without account management takes this same path, with
+`detail` saying so and an empty `partial` once the credential is rolled back.
 
-`DELETE /api/v1/users/{user}` always attempts both halves. On success it answers
-`{deleted:["creds","storage"]}`; if either half fails the answer is an error
-carrying both `deleted` and `failed`, and both arrays are always present, so
-`"deleted":[]` means "this half removed nothing".
+`DELETE /api/v1/users/{user}` always attempts both halves. A `200` answers
+`{deleted:["creds","storage"]}`, listing only the stores it actually removed. If
+either half fails the answer is an error carrying both `deleted` and `failed`,
+and both arrays are always present, so `"deleted":[]` means "this half removed
+nothing"; deleting an address that exists in only one store is therefore
+reported as a failure (`deleted:["creds"], failed:["storage"]` for a
+credentials-only address).
 
 `PUT /api/v1/users/{user}/password` answers `404` for an address that has no
 credential: the underlying credentials module inserts on a password change, so
 without that check the endpoint would silently create a credential for an
-address nobody has.
+address nobody has. A success answers `{username}` and nothing else.
 
 `PUT /api/v1/users/{user}/appendlimit` requires the `value` field to be present;
 `{"value":null}` clears the limit and an absent `value` is a `400`, so a
-malformed request cannot clear a quota.
+malformed request cannot clear a quota. A success answers
+`{username, appendlimit}`, echoing the value it was given; the stored value is
+not read back.
 
 ## Mailboxes
 
@@ -230,8 +249,9 @@ backend marks the row, deletes it and drops the stored blob, and active IMAP
 sessions for that mailbox are interrupted, as the `maddy imap-msgs remove`
 subcommand warns. `DelMessages` reports no count, so `deleted` is the mailbox's
 message-count delta: `{"deleted":0}` with a `200` conflates "nothing matched"
-and "the count probe failed", and deleting a UID that is not present is not an
-error.
+and "the count probe failed". In a mailbox that holds messages, deleting a UID
+that is not present is not an error; in an empty mailbox the delete is a `404`,
+because there the backend reports "no messages matched".
 
 ## Limits
 
@@ -264,8 +284,12 @@ produce `413` as well.
   `0.9.7-0.20261026191710-7931ac3fd885+dirty`, a `go install`-style build
   reports `go-build`), not from the version string `build.sh` injects into the
   binary. Use it as a liveness probe, not as a version probe.
-- Logins (successful and failed) and every mutating action are logged by the
-  `api` sublogger, with the authenticated administrator's address.
+- The `api` sublogger logs every login, successful and failed, and every
+  mutating action that succeeded; of the failing ones it logs the storage-layer
+  failures (mailbox, message, password, APPENDLIMIT, incomplete user delete) and
+  a user create that left state behind. A user create that fails and rolls back
+  cleanly, and the create whose existence lookup fails, are not logged; the
+  response is the only record of them.
 
 ## Reload
 
